@@ -1,0 +1,4 @@
+/target
+/.claude
+**/*.rs.bk
+*.smt2.tmp

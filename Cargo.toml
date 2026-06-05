@@ -1,0 +1,25 @@
+[package]
+name = "fp-sls"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust port of OL1V3R: stochastic local search for QF_BV/QF_FP SMT (Fröhlich et al., AAAI 2015)"
+license = "MIT"
+
+[[bin]]
+name = "fp-sls"
+path = "src/main.rs"
+
+[lib]
+name = "fp_sls"
+path = "src/lib.rs"
+
+[dependencies]
+# GMP/MPFR-backed arbitrary-precision integers, rationals, and floats.
+# `Float` with precision = significand width mirrors Racket's math/bigfloat;
+# `Rational` gives exact scores (TODO #7).
+rug = { version = "1.24", default-features = false, features = ["integer", "rational", "float"] }
+# Seedable RNG for reproducible `--seed` runs.
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+[profile.release]
+opt-level = 3
