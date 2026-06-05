@@ -162,20 +162,25 @@ pub fn eliminate_eqs(path: &str) -> std::io::Result<std::path::PathBuf> {
         .filter(|e| matches!(e.head_sym(), Some("declare-const") | Some("declare-fun")))
         .collect();
 
-    // Replace check-sat with the solve-eqs tactic application.
+    // Strip any (check-sat) and append the tactic application. (Some QF_FP
+    // files omit (check-sat) entirely; a plain `replace("check-sat", …)` would
+    // then leave no command and z3 would emit nothing.)
     let tactic_file = temp_path("solveeqs-in");
     std::fs::write(
         &tactic_file,
-        raw.replace("check-sat", "apply solve-eqs"),
+        format!("{}\n(apply solve-eqs)\n", raw.replace("(check-sat)", "")),
     )?;
     let output = run_z3(&tactic_file)?;
     let _ = std::fs::remove_file(&tactic_file);
 
-    // Z3 prints `(goals (goal <lits…> :precision …))`. Extract the literals.
+    // Z3 prints `(goals (goal <lits…> :precision …))`. Extract the literals; if
+    // the output is empty or unexpected, fall back to the original file rather
+    // than emit an (unsound) empty-assertion goal.
     let forms = read_all(&output);
-    let goal_lits: Vec<Sexp> = forms
+    let goal_lits: Option<Vec<Sexp>> = forms
         .first()
         .and_then(|f| f.as_list())
+        .filter(|g| g.first().is_some_and(|h| h.is_sym("goals")))
         .and_then(|g| g.get(1)) // (goal …)
         .and_then(|goal| goal.as_list())
         .map(|goal| {
@@ -184,8 +189,12 @@ pub fn eliminate_eqs(path: &str) -> std::io::Result<std::path::PathBuf> {
                 .filter(|x| matches!(x, Sexp::List(_)))
                 .cloned()
                 .collect()
-        })
-        .unwrap_or_default();
+        });
+
+    let goal_lits = match goal_lits {
+        Some(lits) => lits,
+        None => return Ok(std::path::PathBuf::from(path)),
+    };
 
     let out_path = temp_path("solveeqs-out");
     {
