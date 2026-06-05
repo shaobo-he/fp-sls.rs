@@ -31,8 +31,20 @@ fn temp_path(tag: &str) -> std::path::PathBuf {
     p
 }
 
+/// Per-call z3 wall-clock limit (seconds) and memory limit (MB). Without these,
+/// z3 can run unboundedly on a hard (e.g. nonlinear, from `--try-real-models`)
+/// query — and if our process is killed meanwhile, the z3 child is orphaned and
+/// keeps running, so many such orphans accumulate and exhaust the machine. With
+/// the limits z3 self-terminates and our parsers fall back gracefully.
+const Z3_TIMEOUT_SECS: u32 = 60;
+const Z3_MEMORY_MB: u32 = 2048;
+
 fn run_z3(path: &std::path::Path) -> std::io::Result<String> {
-    let out = Command::new("z3").arg(path).output()?;
+    let out = Command::new("z3")
+        .arg(format!("-T:{Z3_TIMEOUT_SECS}"))
+        .arg(format!("-memory:{Z3_MEMORY_MB}"))
+        .arg(path)
+        .output()?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
