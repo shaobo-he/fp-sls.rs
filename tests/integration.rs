@@ -22,6 +22,7 @@ fn params(step: usize) -> Params {
         max_steps: step,
         wp: 0.001,
         debug: false,
+        stats: false,
     }
 }
 

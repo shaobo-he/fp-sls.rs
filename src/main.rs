@@ -23,6 +23,7 @@ struct Options {
     elim_eqs: bool,
     print_models: bool,
     debug: bool,
+    stats: bool,
     file: Option<String>,
 }
 
@@ -40,6 +41,7 @@ impl Default for Options {
             elim_eqs: false,
             print_models: false,
             debug: false,
+            stats: false,
             file: None,
         }
     }
@@ -62,6 +64,7 @@ options:
   --elim-eqs                 preprocess with Z3's solve-eqs tactic
   --print-models             print the model when sat
   --debug                    log per-step score to stderr
+  --stats                    print `steps <n>` to stderr on a sat result
   -h, --help                 show this help
 ";
 
@@ -140,6 +143,7 @@ fn parse_args() -> Result<Options, String> {
             "--elim-eqs" => opts.elim_eqs = true,
             "--print-models" => opts.print_models = true,
             "--debug" => opts.debug = true,
+            "--stats" => opts.stats = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}"));
             }
@@ -214,6 +218,7 @@ fn main() {
         max_steps: opts.step,
         wp: opts.wp,
         debug: opts.debug,
+        stats: opts.stats,
     };
 
     let result = if opts.heuristics {

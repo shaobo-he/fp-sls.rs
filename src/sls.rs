@@ -49,6 +49,8 @@ pub struct Params {
     pub wp: f64,
     /// When set, log the per-step formula score to stderr (`--debug`).
     pub debug: bool,
+    /// When set, print `steps <n>` to stderr on a `sat` result (`--stats`).
+    pub stats: bool,
 }
 
 // ---------- assignment construction ----------
@@ -212,6 +214,9 @@ pub fn sls(
             .map(|a| formula_score(&params.c2, &assignment, a))
             .collect();
         if all_satisfied(&assert_scores) {
+            if params.stats {
+                eprintln!("steps {step}");
+            }
             return SolveResult::Sat(get_models(&assignment, &asserts));
         }
 
@@ -275,6 +280,9 @@ pub fn sls_vns(
             .map(|a| formula_score(&params.c2, &assignment, a))
             .collect();
         if all_satisfied(&assert_scores) {
+            if params.stats {
+                eprintln!("steps {step}");
+            }
             return SolveResult::Sat(get_models(&assignment, &asserts));
         }
 
@@ -438,6 +446,9 @@ pub fn sls_heuristics(
                 .map(|a| formula_score(&params.c2, &assignment, a))
                 .collect();
             if all_satisfied(&assert_scores) {
+                if params.stats {
+                    eprintln!("steps {moves}");
+                }
                 return SolveResult::Sat(get_models(&assignment, &asserts));
             }
 
