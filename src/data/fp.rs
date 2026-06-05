@@ -10,8 +10,31 @@
 use crate::data::bitvec::{two_pow, BitVec};
 use crate::rng::Rng;
 use crate::sexp::Sexp;
+use rug::float::Round;
 use rug::{Float, Integer, Rational};
 use std::cmp::Ordering;
+
+/// The five SMT-LIB rounding-mode constants (used to enumerate `RoundingMode`
+/// variables).
+pub const ROUNDING_MODES: [&str; 5] = [
+    "roundNearestTiesToEven",
+    "roundTowardZero",
+    "roundTowardPositive",
+    "roundTowardNegative",
+    "roundNearestTiesToAway",
+];
+
+/// Map an SMT-LIB rounding-mode symbol (long name or abbreviation) to MPFR's.
+pub fn rounding_mode(sym: &str) -> Option<Round> {
+    Some(match sym {
+        "roundNearestTiesToEven" | "RNE" => Round::Nearest,
+        "roundTowardZero" | "RTZ" => Round::Zero,
+        "roundTowardPositive" | "RTP" => Round::Up,
+        "roundTowardNegative" | "RTN" => Round::Down,
+        "roundNearestTiesToAway" | "RNA" => Round::AwayZero,
+        _ => return None,
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct FloatingPoint {
@@ -40,21 +63,35 @@ where
     Float::with_val(prec, v)
 }
 
-/// Round `num/den` (den > 0) to the nearest integer, ties to even.
-/// Reproduces Racket's `round` on an exact rational.
-fn round_ties_even(num: Integer, den: &Integer) -> Integer {
+/// Round the positive rational `num/den` (den > 0) to an integer according to
+/// `round`, where `negative` is the sign of the value being rounded (so the
+/// directed modes round the magnitude in the correct direction).
+fn round_rational(num: Integer, den: &Integer, round: Round, negative: bool) -> Integer {
     let (q, r) = num.div_rem_euc(den.clone());
+    if r == 0 {
+        return q;
+    }
     let two_r = Integer::from(&r * 2);
-    match two_r.cmp(den) {
-        Ordering::Less => q,
-        Ordering::Greater => q + Integer::from(1),
-        Ordering::Equal => {
-            if q.is_even() {
-                q
-            } else {
-                q + Integer::from(1)
-            }
-        }
+    let up = match round {
+        Round::Zero => false,        // truncate magnitude toward zero
+        Round::Up => !negative,      // toward +∞: positive rounds up, negative down
+        Round::Down => negative,     // toward −∞: positive rounds down, negative up
+        Round::Nearest => match two_r.cmp(den) {
+            Ordering::Less => false,
+            Ordering::Greater => true,
+            Ordering::Equal => q.is_odd(), // ties to even
+        },
+        Round::AwayZero => match two_r.cmp(den) {
+            Ordering::Less => false,
+            Ordering::Greater => true,
+            Ordering::Equal => true, // ties away from zero
+        },
+        _ => false,
+    };
+    if up {
+        q + Integer::from(1)
+    } else {
+        q
     }
 }
 
@@ -190,29 +227,68 @@ impl FloatingPoint {
 
     // ----- core arithmetic with renormalization -----
 
-    fn renormalize(value: Float, exp_width: u32, sig_width: u32) -> FloatingPoint {
-        // overflow → ±∞
+    fn renormalize(value: Float, exp_width: u32, sig_width: u32, round: Round) -> FloatingPoint {
+        // overflow → ±∞ or ±max-normal, depending on the mode and sign.
         let max_normal = FloatingPoint::maximum_normal(exp_width, sig_width);
         let abs = Float::with_val(sig_width, value.abs_ref());
         if abs > max_normal.value {
-            return if value.is_sign_negative() {
-                FloatingPoint::minus_inf(exp_width, sig_width)
-            } else {
-                FloatingPoint::plus_inf(exp_width, sig_width)
+            let neg = value.is_sign_negative();
+            let pinf = || FloatingPoint::plus_inf(exp_width, sig_width);
+            let ninf = || FloatingPoint::minus_inf(exp_width, sig_width);
+            return match round {
+                // nearest / ties-away overflow to infinity
+                Round::Nearest | Round::AwayZero => {
+                    if neg {
+                        ninf()
+                    } else {
+                        pinf()
+                    }
+                }
+                // toward zero never overflows to infinity
+                Round::Zero => {
+                    if neg {
+                        max_normal.fpneg()
+                    } else {
+                        max_normal
+                    }
+                }
+                // toward +∞
+                Round::Up => {
+                    if neg {
+                        max_normal.fpneg()
+                    } else {
+                        pinf()
+                    }
+                }
+                // toward −∞
+                Round::Down => {
+                    if neg {
+                        ninf()
+                    } else {
+                        max_normal
+                    }
+                }
+                _ => {
+                    if neg {
+                        ninf()
+                    } else {
+                        pinf()
+                    }
+                }
             };
         }
-        // nonzero but |result| ≤ max subnormal → round into subnormal grid
+        // nonzero but |result| ≤ max subnormal → round into the subnormal grid.
         let max_sub = FloatingPoint::maximum_subnormal(exp_width, sig_width);
         if !value.is_zero() && abs <= max_sub.value {
-            return FloatingPoint::round_to_subnormal(&value, exp_width, sig_width);
+            return FloatingPoint::round_to_subnormal(&value, exp_width, sig_width, round);
         }
         FloatingPoint::new(exp_width, sig_width, value)
     }
 
-    /// `(eval/fparith/binop op)` — apply `op` at precision `sig`, then renormalize.
-    fn arith<F>(&self, o: &FloatingPoint, op: F) -> FloatingPoint
+    /// Apply `op` at precision `sig` with rounding `round`, then renormalize.
+    fn arith<F>(&self, o: &FloatingPoint, round: Round, op: F) -> FloatingPoint
     where
-        F: Fn(&Float, &Float, u32) -> Float,
+        F: Fn(&Float, &Float, u32, Round) -> Float,
     {
         assert!(
             self.value.prec() == o.value.prec()
@@ -220,33 +296,40 @@ impl FloatingPoint {
                 && self.sig_width == o.sig_width,
             "invalid arithmetic operation"
         );
-        let result = op(&self.value, &o.value, self.prec());
-        FloatingPoint::renormalize(result, self.exp_width, self.sig_width)
+        let result = op(&self.value, &o.value, self.prec(), round);
+        FloatingPoint::renormalize(result, self.exp_width, self.sig_width, round)
     }
 
-    pub fn fpadd(&self, o: &FloatingPoint) -> FloatingPoint {
-        self.arith(o, |a, b, p| fl(p, a + b))
+    pub fn fpadd(&self, o: &FloatingPoint, round: Round) -> FloatingPoint {
+        self.arith(o, round, |a, b, p, r| Float::with_val_round(p, a + b, r).0)
     }
-    pub fn fpsub(&self, o: &FloatingPoint) -> FloatingPoint {
-        self.arith(o, |a, b, p| fl(p, a - b))
+    pub fn fpsub(&self, o: &FloatingPoint, round: Round) -> FloatingPoint {
+        self.arith(o, round, |a, b, p, r| Float::with_val_round(p, a - b, r).0)
     }
-    pub fn fpmul(&self, o: &FloatingPoint) -> FloatingPoint {
-        self.arith(o, |a, b, p| fl(p, a * b))
+    pub fn fpmul(&self, o: &FloatingPoint, round: Round) -> FloatingPoint {
+        self.arith(o, round, |a, b, p, r| Float::with_val_round(p, a * b, r).0)
     }
-    pub fn fpdiv(&self, o: &FloatingPoint) -> FloatingPoint {
-        self.arith(o, |a, b, p| fl(p, a / b))
+    pub fn fpdiv(&self, o: &FloatingPoint, round: Round) -> FloatingPoint {
+        self.arith(o, round, |a, b, p, r| Float::with_val_round(p, a / b, r).0)
     }
-    pub fn fpsqrt(&self) -> FloatingPoint {
-        self.arith(self, |a, _, p| fl(p, a.sqrt_ref()))
-    }
-
-    /// `(fp/prune fp)` — push a value through renormalization without changing it.
-    pub fn prune(&self) -> FloatingPoint {
-        self.arith(self, |a, _, p| fl(p, a))
+    pub fn fpsqrt(&self, round: Round) -> FloatingPoint {
+        self.arith(self, round, |a, _, p, r| {
+            Float::with_val_round(p, a.sqrt_ref(), r).0
+        })
     }
 
-    /// `(fp/round-to-subnormal v exp sig)`.
-    fn round_to_subnormal(v: &Float, exp_width: u32, sig_width: u32) -> FloatingPoint {
+    /// `(fp/prune fp)` — push a value through renormalization in mode `round`.
+    pub fn prune(&self, round: Round) -> FloatingPoint {
+        self.arith(self, round, |a, _, p, r| Float::with_val_round(p, a, r).0)
+    }
+
+    /// `(fp/round-to-subnormal v exp sig)` in mode `round`.
+    fn round_to_subnormal(
+        v: &Float,
+        exp_width: u32,
+        sig_width: u32,
+        round: Round,
+    ) -> FloatingPoint {
         let subnormal_min = FloatingPoint::from_bitvec(
             &BitVec::new(exp_width + sig_width, Integer::from(1)),
             exp_width,
@@ -256,27 +339,23 @@ impl FloatingPoint {
         let pv = Float::with_val(sig_width, v.abs_ref());
         let (s1, p1) = pv.to_integer_exp().expect("finite nonzero");
         let (s2, p2) = subnormal_min.to_integer_exp().expect("finite nonzero");
-        // r = round( (s1·2^p1) / (s2·2^p2) ) ties-to-even
         let d = p1 - p2;
         let (num, den) = if d >= 0 {
             (s1 << (d as u32), s2)
         } else {
             (s1, s2 << ((-d) as u32))
         };
-        let r = round_ties_even(num, &den);
+        let neg = v.is_sign_negative();
+        let r = round_rational(num, &den, round, neg);
         if r < 1 {
-            FloatingPoint::real_from_f64(
-                if v.is_sign_negative() { -0.0 } else { 0.0 },
-                exp_width,
-                sig_width,
-            )
+            FloatingPoint::real_from_f64(if neg { -0.0 } else { 0.0 }, exp_width, sig_width)
         } else {
             let rv = FloatingPoint::from_bitvec(
                 &BitVec::new(exp_width + sig_width, r),
                 exp_width,
                 sig_width,
             );
-            if v.is_sign_negative() {
+            if neg {
                 rv.fpneg()
             } else {
                 rv
@@ -284,24 +363,24 @@ impl FloatingPoint {
         }
     }
 
-    /// `(eval/fpconv fp dest-exp dest-sig)`.
-    pub fn fpconv(&self, dest_exp: u32, dest_sig: u32) -> FloatingPoint {
+    /// `(eval/fpconv fp dest-exp dest-sig)` in mode `round`.
+    pub fn fpconv(&self, dest_exp: u32, dest_sig: u32, round: Round) -> FloatingPoint {
         let copied = FloatingPoint::new(
             dest_exp,
             dest_sig,
-            Float::with_val(dest_sig, &self.value), // bfcopy at new precision
+            Float::with_val_round(dest_sig, &self.value, round).0,
         );
         if self.is_nan() || self.is_infinity() {
             copied
         } else {
-            copied.prune()
+            copied.prune(round)
         }
     }
 
     // ----- conversions to/from a real number -----
 
     fn real_from_float(value: Float, exp_width: u32, sig_width: u32) -> FloatingPoint {
-        FloatingPoint::new(exp_width, sig_width, value).prune()
+        FloatingPoint::new(exp_width, sig_width, value).prune(Round::Nearest)
     }
 
     /// `(real->FloatingPoint rv exp sig)` for a machine double `rv`.
@@ -469,7 +548,11 @@ impl FloatingPoint {
     /// `(exp/± fp)` — multiply / divide by two.
     fn exp_pm(&self) -> Vec<FloatingPoint> {
         let two = self.two();
-        vec![self.fpmul(&two), self.fpdiv(&two)]
+        // ×2 / ÷2 are exact, so the rounding mode is irrelevant here.
+        vec![
+            self.fpmul(&two, Round::Nearest),
+            self.fpdiv(&two, Round::Nearest),
+        ]
     }
 
     /// `(sig/± fp)` — ±1 on the underlying bit-vector.
@@ -631,8 +714,8 @@ mod tests {
         let one = FloatingPoint::real_from_f64(1.0, 5, 11);
         let pz = FloatingPoint::real_from_f64(0.0, 5, 11);
         let nz = FloatingPoint::real_from_f64(-0.0, 5, 11);
-        assert!(one.fpdiv(&pz).is_infinity() && one.fpdiv(&pz).is_positive());
-        assert!(one.fpdiv(&nz).is_infinity() && one.fpdiv(&nz).is_negative());
+        assert!(one.fpdiv(&pz, Round::Nearest).is_infinity() && one.fpdiv(&pz, Round::Nearest).is_positive());
+        assert!(one.fpdiv(&nz, Round::Nearest).is_infinity() && one.fpdiv(&nz, Round::Nearest).is_negative());
     }
 
     #[test]
@@ -657,9 +740,17 @@ mod tests {
     fn arithmetic_basic() {
         let a = FloatingPoint::real_from_f64(1.5, 8, 24);
         let b = FloatingPoint::real_from_f64(2.25, 8, 24);
-        assert_eq!(a.fpadd(&b).to_f64(), 3.75);
-        assert_eq!(a.fpmul(&b).to_f64(), 3.375);
-        assert_eq!(b.fpsub(&a).to_f64(), 0.75);
-        assert_eq!(FloatingPoint::real_from_f64(9.0, 8, 24).fpsqrt().to_f64(), 3.0);
+        let rne = Round::Nearest;
+        assert_eq!(a.fpadd(&b, rne).to_f64(), 3.75);
+        assert_eq!(a.fpmul(&b, rne).to_f64(), 3.375);
+        assert_eq!(b.fpsub(&a, rne).to_f64(), 0.75);
+        assert_eq!(FloatingPoint::real_from_f64(9.0, 8, 24).fpsqrt(rne).to_f64(), 3.0);
+
+        // directed rounding: 1/3 at Float32 differs by mode
+        let one = FloatingPoint::real_from_f64(1.0, 8, 24);
+        let three = FloatingPoint::real_from_f64(3.0, 8, 24);
+        let down = one.fpdiv(&three, Round::Down).to_f64();
+        let up = one.fpdiv(&three, Round::Up).to_f64();
+        assert!(down < up, "toward -inf must be < toward +inf for 1/3");
     }
 }

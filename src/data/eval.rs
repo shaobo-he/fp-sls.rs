@@ -10,10 +10,22 @@
 //! a term operand. This port implements the obviously-intended behaviour.
 
 use crate::data::bitvec::BitVec;
-use crate::data::fp::FloatingPoint;
+use crate::data::fp::{rounding_mode, FloatingPoint};
 use crate::data::value::{Assignment, Value};
 use crate::sexp::Sexp;
+use rug::float::Round;
 use rug::Integer;
+
+/// Read a constant rounding-mode operand (e.g. `roundTowardZero`). The mode must
+/// be a constant — `RoundingMode` *variables* are eliminated by enumeration
+/// before evaluation, so a non-constant here is an error (keeps results sound,
+/// rather than silently rounding to nearest).
+fn rm(s: &Sexp) -> Round {
+    match s.as_sym().and_then(rounding_mode) {
+        Some(r) => r,
+        None => panic!("non-constant or unsupported rounding mode: {s}"),
+    }
+}
 
 /// `(get-value assignment sym)`.
 pub fn get_value<'a>(asn: &'a Assignment, sym: &str) -> &'a Value {
@@ -77,7 +89,7 @@ fn eval_list(items: &[Sexp], asn: &Assignment, env: &[(String, Value)]) -> Value
             let ne = h[2].as_u32().expect("to_fp exp width");
             let ns = h[3].as_u32().expect("to_fp sig width");
             let op = as_fp(eval(&items[2], asn, env));
-            return Value::FP(op.fpconv(ne, ns));
+            return Value::FP(op.fpconv(ne, ns, rm(&items[1])));
         }
         panic!("unsupported operation: {}", Sexp::List(items.to_vec()));
     }
@@ -107,12 +119,12 @@ fn eval_list(items: &[Sexp], asn: &Assignment, env: &[(String, Value)]) -> Value
         }
 
         // floating-point arithmetic — first operand of binops is the rounding mode
-        "fp.add" => Value::FP(fp(2).fpadd(&fp(3))),
-        "fp.sub" => Value::FP(fp(2).fpsub(&fp(3))),
-        "fp.mul" => Value::FP(fp(2).fpmul(&fp(3))),
-        "fp.div" => Value::FP(fp(2).fpdiv(&fp(3))),
+        "fp.add" => Value::FP(fp(2).fpadd(&fp(3), rm(&items[1]))),
+        "fp.sub" => Value::FP(fp(2).fpsub(&fp(3), rm(&items[1]))),
+        "fp.mul" => Value::FP(fp(2).fpmul(&fp(3), rm(&items[1]))),
+        "fp.div" => Value::FP(fp(2).fpdiv(&fp(3), rm(&items[1]))),
         "fp.neg" => Value::FP(fp(1).fpneg()),
-        "fp.sqrt" => Value::FP(fp(2).fpsqrt()),
+        "fp.sqrt" => Value::FP(fp(2).fpsqrt(rm(&items[1]))),
 
         // floating-point predicates (yield width-1 bit-vectors)
         "fp.isNormal" => Value::BV(BitVec::from_bool(fp(1).is_normal())),

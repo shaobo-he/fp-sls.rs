@@ -200,12 +200,36 @@ cargo clippy        # lints
 model by reconstructing the assignment and checking the formula scores to
 exactly 1.
 
+## Rounding modes
+
+Unlike the Racket original (which ignored the rounding-mode argument and always
+rounded to nearest), the evaluator **honors the rounding mode** of every FP
+operation: all five IEEE modes (`roundNearestTiesToEven`, `roundTowardZero`,
+`roundToward{Positive,Negative}`, `roundNearestTiesToAway`) map to MPFR's, with
+mode-aware overflow (e.g. toward-zero yields max-normal, not ∞). A *non-constant*
+rounding mode is rejected (error) rather than silently treated as nearest, so
+results stay sound.
+
+A `RoundingMode` **variable** is not searched but **enumerated**: the solver
+tries each of the five constants in its place (cartesian product for several
+variables, `roundNearestTiesToEven` first), reporting `sat` as soon as one
+combination succeeds — sound *and* complete over rounding modes. The chosen mode
+is included in the printed model.
+
+(Subnormal results use the same two-step rounding as OL1V3R — round to precision,
+then to the subnormal grid — so they can be off by one ULP exactly at the
+denormal boundary; inherited from the original.)
+
 ## Limitations
 
 These match the Racket original (the evaluator is deliberately partial):
 
 * No `ite`, `concat`, `extract`, shifts, or bit-vector↔float reinterpretation of
   *variables* in the evaluator. Such inputs abort with `unsupported operation`.
+  (`--simplify`, on by default, folds away constructs z3 can eliminate — e.g. a
+  constant `ite` — but a genuine `ite` over variables survives.)
+* `fp.fma`, `fp.rem`, `fp.roundToIntegral`, `fp.min`/`max`/`abs` are not
+  implemented.
 * `--vns` supports floating-point variables only.
 * Incomplete solver: only `sat` / `unknown` are reported, never `unsat`.
 

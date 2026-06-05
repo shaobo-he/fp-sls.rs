@@ -270,6 +270,20 @@ fn is_bvconst(items: &[Sexp]) -> bool {
         && items[1].as_sym().is_some_and(|s| s.starts_with("bv"))
 }
 
+/// Replace every symbol that is a key of `subs` with the corresponding
+/// replacement symbol, throughout `f`. Used to substitute `RoundingMode`
+/// variables with a concrete rounding-mode constant during enumeration.
+pub fn substitute(f: &Sexp, subs: &std::collections::HashMap<String, String>) -> Sexp {
+    match f {
+        Sexp::Sym(s) => match subs.get(s) {
+            Some(r) => Sexp::sym(r.clone()),
+            None => f.clone(),
+        },
+        Sexp::List(v) => Sexp::List(v.iter().map(|e| substitute(e, subs)).collect()),
+        _ => f.clone(),
+    }
+}
+
 // ---------- let elimination ----------
 
 fn boolean_expr(s: &Sexp) -> bool {

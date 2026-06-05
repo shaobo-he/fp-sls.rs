@@ -1,14 +1,20 @@
 //! Command-line entry point. Port of `main.rkt`.
 
-use fp_sls::parsing::parse::{get_var_info, prepare_formula};
+use fp_sls::data::fp::ROUNDING_MODES;
+use fp_sls::data::value::Assignment;
+use fp_sls::parsing::parse::{get_var_info, prepare_formula, rounding_mode_type};
 use fp_sls::parsing::reader::{read_all, read_file};
+use fp_sls::parsing::transform::substitute;
 use fp_sls::rng::Rng;
+use fp_sls::sexp::Sexp;
 use fp_sls::sls::{
     initialize_assignment, randomize_assignment, sls, sls_heuristics, sls_vns, Params, SolveResult,
+    VarInfo,
 };
 use fp_sls::z3;
 use rug::ops::Pow;
 use rug::{Integer, Rational};
+use std::collections::HashMap;
 use std::str::FromStr;
 
 struct Options {
@@ -203,18 +209,30 @@ fn main() {
     });
 
     let formula = prepare_formula(&cmds);
-    let var_info = get_var_info(&cmds);
+    let full_var_info = get_var_info(&cmds);
+
+    // Split off RoundingMode variables: they are not searched but enumerated
+    // over the five rounding-mode constants (sound + complete over modes).
+    let mut rm_vars: Vec<String> = full_var_info
+        .iter()
+        .filter(|(_, t)| rounding_mode_type(t))
+        .map(|(k, _)| k.clone())
+        .collect();
+    rm_vars.sort();
+    let mut var_info: VarInfo = full_var_info.clone();
+    for v in &rm_vars {
+        var_info.remove(v);
+    }
 
     let mut rng = Rng::from_seed(opts.seed);
 
-    // Build the initial model.
+    // Initial model over the *search* variables (excludes RoundingMode).
     let mut initial = if opts.start_with_zeros {
         initialize_assignment(&var_info)
     } else {
         randomize_assignment(&var_info, &mut rng)
     };
     if opts.try_real_models {
-        // The relaxation uses the raw declarations/assertions of the input file.
         let raw_cmds = read_all(&std::fs::read_to_string(&input_file).unwrap_or_default());
         if let Some(real) = z3::get_real_model(&raw_cmds, &var_info) {
             initial = real;
@@ -229,12 +247,53 @@ fn main() {
         stats: opts.stats,
     };
 
-    let result = if opts.heuristics {
-        sls_heuristics(&var_info, &formula, &params, initial, &mut rng)
-    } else if opts.vns {
-        sls_vns(&var_info, &formula, &params, initial, &mut rng)
+    // Run the chosen strategy on a (possibly mode-substituted) formula.
+    let run = |f: &Sexp, init: Assignment, rng: &mut Rng| -> SolveResult {
+        if opts.heuristics {
+            sls_heuristics(&var_info, f, &params, init, rng)
+        } else if opts.vns {
+            sls_vns(&var_info, f, &params, init, rng)
+        } else {
+            sls(&var_info, f, &params, init, rng)
+        }
+    };
+
+    let result = if rm_vars.is_empty() {
+        run(&formula, initial, &mut rng)
     } else {
-        sls(&var_info, &formula, &params, initial, &mut rng)
+        // Enumerate the 5^k rounding-mode combinations; combo 0 is all-RNE
+        // (ROUNDING_MODES[0]), so the IEEE-default case is tried first.
+        let k = rm_vars.len();
+        let total = 5u64.checked_pow(k as u32).unwrap_or(u64::MAX);
+        let cap = 10_000u64;
+        let limit = total.min(cap);
+        if total > cap {
+            eprintln!("warning: {k} RoundingMode variables → {total} combinations; trying {cap}");
+        }
+        let mut outcome = SolveResult::Unknown;
+        for idx in 0..limit {
+            let mut subs: HashMap<String, String> = HashMap::new();
+            let mut chosen: Vec<&str> = Vec::with_capacity(k);
+            let mut x = idx;
+            for v in &rm_vars {
+                let d = (x % 5) as usize;
+                x /= 5;
+                subs.insert(v.clone(), ROUNDING_MODES[d].to_string());
+                chosen.push(ROUNDING_MODES[d]);
+            }
+            let f = substitute(&formula, &subs);
+            if let SolveResult::Sat(mut models) = run(&f, initial.clone(), &mut rng) {
+                for (v, m) in rm_vars.iter().zip(&chosen) {
+                    models.push(Sexp::List(vec![
+                        Sexp::sym("assert"),
+                        Sexp::List(vec![Sexp::sym("="), Sexp::sym(*m), Sexp::sym(v.clone())]),
+                    ]));
+                }
+                outcome = SolveResult::Sat(models);
+                break;
+            }
+        }
+        outcome
     };
 
     match result {

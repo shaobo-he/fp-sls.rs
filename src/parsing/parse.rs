@@ -89,6 +89,12 @@ pub fn bool_type(t: &Type) -> bool {
     t.is_sym("Bool")
 }
 
+/// `RoundingMode` sort — a variable of this sort is not searched; it is
+/// enumerated over the five rounding-mode constants (see `main`).
+pub fn rounding_mode_type(t: &Type) -> bool {
+    t.is_sym("RoundingMode")
+}
+
 pub fn fp_type(t: &Type) -> bool {
     match t {
         Sexp::List(v) => v.len() == 4 && v[0].is_sym("_") && v[1].is_sym("FloatingPoint"),
