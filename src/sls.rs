@@ -173,24 +173,21 @@ fn select_assertion<'a>(asserts: &'a [Sexp], scores: &[Rational]) -> &'a Sexp {
     &asserts[best]
 }
 
-/// Index and score of the highest-scoring neighbor (first on ties).
-fn argmax_score(c2: &Rational, neighbors: &[Assignment], f: &Sexp) -> (usize, Rational) {
-    let mut best = 0;
-    let mut best_score = formula_score(c2, &neighbors[0], f);
-    for i in 1..neighbors.len() {
-        let s = formula_score(c2, &neighbors[i], f);
-        if s > best_score {
-            best_score = s;
-            best = i;
-        }
-    }
-    (best, best_score)
-}
-
-fn extend_assignment(asn: &Assignment, var: &str, val: Value) -> Assignment {
-    let mut a = asn.clone();
-    a.insert(var.to_string(), val);
-    a
+/// Score `f` as if `var := nv`, then restore `asn` to its prior state.
+///
+/// This avoids materializing a neighbor assignment: the single live assignment
+/// is mutated in place and reverted, so each neighbor costs O(1) memory instead
+/// of a full map clone. (The Racket original got the same effect from persistent
+/// immutable hashes; this is the in-place equivalent and selects the identical
+/// move, since the score of "α with one variable changed" is unchanged.)
+fn score_with_move(c2: &Rational, asn: &mut Assignment, f: &Sexp, var: &str, nv: &Value) -> Rational {
+    let old = std::mem::replace(
+        asn.get_mut(var).expect("candidate variable present in assignment"),
+        nv.clone(),
+    );
+    let s = formula_score(c2, asn, f);
+    *asn.get_mut(var).expect("candidate variable present in assignment") = old;
+    s
 }
 
 fn all_satisfied(scores: &[Rational]) -> bool {
@@ -227,37 +224,53 @@ pub fn sls(
         let cand = select_assertion(&asserts, &assert_scores);
         let cand_vars = get_vars(cand, &assignment);
 
-        // Extended neighborhood of every candidate variable.
-        let mut neighbors: Vec<Assignment> = Vec::new();
+        // Extended neighborhood of every candidate variable, as cheap
+        // `(var, value)` moves scored in place (no per-neighbor assignment copy).
+        let mut moves: Vec<(&str, Value)> = Vec::new();
         for var in &cand_vars {
             let val = get_value(&assignment, var).clone();
             for nv in extended_neighbor_values(&val, rng) {
-                neighbors.push(extend_assignment(&assignment, var, nv));
+                moves.push((var.as_str(), nv));
             }
         }
 
-        if neighbors.is_empty() {
+        if moves.is_empty() {
             assignment = randomize_assignment(var_info, rng);
             continue;
         }
 
-        let accepted = if rng.coin_flip(params.wp) {
+        let chosen: Option<usize> = if rng.coin_flip(params.wp) {
             // Random walk: take any neighbor regardless of score.
-            let idx = rng.below(neighbors.len());
-            Some(neighbors.swap_remove(idx))
+            Some(rng.below(moves.len()))
         } else {
-            let (best_idx, best_score) = argmax_score(&params.c2, &neighbors, f);
+            // Highest-scoring move (first on ties), scored via mutate-and-revert.
+            let mut best = 0;
+            let mut best_score =
+                score_with_move(&params.c2, &mut assignment, f, moves[0].0, &moves[0].1);
+            for i in 1..moves.len() {
+                let s = score_with_move(&params.c2, &mut assignment, f, moves[i].0, &moves[i].1);
+                if s > best_score {
+                    best_score = s;
+                    best = i;
+                }
+            }
             if best_score > curr_score {
-                Some(neighbors.swap_remove(best_idx))
+                Some(best)
             } else {
                 None
             }
         };
 
-        assignment = match accepted {
-            Some(a) => a,
-            None => randomize_assignment(var_info, rng),
-        };
+        match chosen {
+            Some(i) => {
+                let var = moves[i].0;
+                let nv = moves[i].1.clone();
+                *assignment
+                    .get_mut(var)
+                    .expect("candidate variable present in assignment") = nv;
+            }
+            None => assignment = randomize_assignment(var_info, rng),
+        }
     }
     SolveResult::Unknown
 }
@@ -293,28 +306,41 @@ pub fn sls_vns(
         let cand = select_assertion(&asserts, &assert_scores);
         let cand_vars = get_vars(cand, &assignment);
 
-        let mut neighbors: Vec<Assignment> = Vec::new();
+        let mut moves: Vec<(&str, Value)> = Vec::new();
         for var in &cand_vars {
             let val = get_value(&assignment, var).clone();
             for nv in vns_neighbor_values(&val, ni, rng) {
-                neighbors.push(extend_assignment(&assignment, var, nv));
+                moves.push((var.as_str(), nv));
             }
         }
 
-        let improving = if neighbors.is_empty() {
+        let improving: Option<usize> = if moves.is_empty() {
             None
         } else {
-            let (best_idx, best_score) = argmax_score(&params.c2, &neighbors, f);
+            let mut best = 0;
+            let mut best_score =
+                score_with_move(&params.c2, &mut assignment, f, moves[0].0, &moves[0].1);
+            for i in 1..moves.len() {
+                let s = score_with_move(&params.c2, &mut assignment, f, moves[i].0, &moves[i].1);
+                if s > best_score {
+                    best_score = s;
+                    best = i;
+                }
+            }
             if best_score > curr_score {
-                Some(neighbors.swap_remove(best_idx))
+                Some(best)
             } else {
                 None
             }
         };
 
         match improving {
-            Some(a) => {
-                assignment = a;
+            Some(i) => {
+                let var = moves[i].0;
+                let nv = moves[i].1.clone();
+                *assignment
+                    .get_mut(var)
+                    .expect("candidate variable present in assignment") = nv;
                 ni = 1;
             }
             None => {
@@ -392,26 +418,24 @@ fn select_assertion_ucb(assert_scores: &[Rational], selected: &[u64], moves: u64
     best.expect("at least one unsatisfied assertion")
 }
 
-fn argmax_weighted(
+/// Weighted score of `f`'s assertions as if `var := nv`, then restore `asn`
+/// (the in-place analogue of [`score_with_move`] for the heuristics search).
+fn weighted_score_with_move(
     c2: &Rational,
     weights: &[Rational],
     asserts: &[Sexp],
-    neighbors: &[Assignment],
-) -> (usize, Rational) {
-    let score_of = |a: &Assignment| -> Rational {
-        let scores: Vec<Rational> = asserts.iter().map(|x| formula_score(c2, a, x)).collect();
-        weighted_score(weights, &scores)
-    };
-    let mut best = 0;
-    let mut best_score = score_of(&neighbors[0]);
-    for i in 1..neighbors.len() {
-        let s = score_of(&neighbors[i]);
-        if s > best_score {
-            best_score = s;
-            best = i;
-        }
-    }
-    (best, best_score)
+    asn: &mut Assignment,
+    var: &str,
+    nv: &Value,
+) -> Rational {
+    let old = std::mem::replace(
+        asn.get_mut(var).expect("candidate variable present in assignment"),
+        nv.clone(),
+    );
+    let scores: Vec<Rational> = asserts.iter().map(|x| formula_score(c2, asn, x)).collect();
+    let w = weighted_score(weights, &scores);
+    *asn.get_mut(var).expect("candidate variable present in assignment") = old;
+    w
 }
 
 /// WalkSAT search augmented with the paper's heuristics. `initial` seeds the
@@ -460,30 +484,47 @@ pub fn sls_heuristics(
             }
             let cand_vars = get_vars(&asserts[cand_idx], &assignment);
 
-            let mut neighbors: Vec<Assignment> = Vec::new();
+            let mut moves: Vec<(&str, Value)> = Vec::new();
             for var in &cand_vars {
                 let val = get_value(&assignment, var).clone();
                 for nv in extended_neighbor_values(&val, rng) {
-                    neighbors.push(extend_assignment(&assignment, var, nv));
+                    moves.push((var.as_str(), nv));
                 }
             }
 
-            let accepted = if neighbors.is_empty() {
+            let chosen: Option<usize> = if moves.is_empty() {
                 None
             } else if rng.coin_flip(params.wp) {
-                let idx = rng.below(neighbors.len());
-                Some(neighbors.swap_remove(idx))
+                Some(rng.below(moves.len()))
             } else {
-                let (bi, bw) = argmax_weighted(&params.c2, &weights, &asserts, &neighbors);
-                if bw > curr_w {
-                    Some(neighbors.swap_remove(bi))
+                let mut best = 0;
+                let mut best_w = weighted_score_with_move(
+                    &params.c2, &weights, &asserts, &mut assignment, moves[0].0, &moves[0].1,
+                );
+                for i in 1..moves.len() {
+                    let w = weighted_score_with_move(
+                        &params.c2, &weights, &asserts, &mut assignment, moves[i].0, &moves[i].1,
+                    );
+                    if w > best_w {
+                        best_w = w;
+                        best = i;
+                    }
+                }
+                if best_w > curr_w {
+                    Some(best)
                 } else {
                     None
                 }
             };
 
-            match accepted {
-                Some(a) => assignment = a,
+            match chosen {
+                Some(i) => {
+                    let var = moves[i].0;
+                    let nv = moves[i].1.clone();
+                    *assignment
+                        .get_mut(var)
+                        .expect("candidate variable present in assignment") = nv;
+                }
                 None => {
                     // PAWS weight update on randomization.
                     let one = Rational::from(1);
