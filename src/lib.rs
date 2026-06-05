@@ -4,6 +4,7 @@
 //! Search for Satisfiability Modulo Theories" (AAAI 2015). Module layout mirrors
 //! the original Racket repository for traceability.
 
+pub mod dag;
 pub mod rng;
 pub mod sexp;
 

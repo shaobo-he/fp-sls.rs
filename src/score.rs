@@ -345,6 +345,45 @@ pub fn score(c: &R, asn: &Assignment, env: &[(String, Value)], formula: &Sexp) -
     }
 }
 
+/// Score a binary atom `(head v1 v2)` (or its negation) directly from the
+/// operand *values*. Used by the DAG scorer so it reuses the exact same case
+/// analysis as the recursive `score` above. `head` is the atom's operator
+/// symbol (`=`, `bvult`, `fp.lt`, …).
+pub(crate) fn score_atom(c: &R, head: &str, neg: bool, v1: &Value, v2: &Value) -> R {
+    if !neg {
+        match head {
+            "=" => score_eq(c, v1, v2),
+            "bvult" => score_bv_lt(c, v1.as_bv(), v2.as_bv()),
+            "fp.lt" => score_fplt(c, v1.as_fp(), v2.as_fp()),
+            "fp.leq" => score_fpleq(c, v1.as_fp(), v2.as_fp()),
+            "fp.gt" => score_fpgt(c, v1.as_fp(), v2.as_fp()),
+            "fp.geq" => score_fpgeq(c, v1.as_fp(), v2.as_fp()),
+            "fp.eq" => score_fpeq(c, v1.as_fp(), v2.as_fp()),
+            _ => panic!("not a scorable atom: {head}"),
+        }
+    } else {
+        match head {
+            "=" => score_ne(v1, v2),
+            "bvult" => score_bv_ge(c, v1.as_bv(), v2.as_bv()),
+            "fp.lt" => score_fp_not_lt(c, v1.as_fp(), v2.as_fp()),
+            "fp.leq" => score_fp_not_leq(c, v1.as_fp(), v2.as_fp()),
+            "fp.gt" => score_fp_not_gt(c, v1.as_fp(), v2.as_fp()),
+            "fp.geq" => score_fp_not_geq(c, v1.as_fp(), v2.as_fp()),
+            "fp.eq" => score_fp_not_eq(v1.as_fp(), v2.as_fp()),
+            _ => panic!("not a scorable atom: {head}"),
+        }
+    }
+}
+
+/// Score a bare boolean term value (a width-1 bit-vector), negated or not.
+pub(crate) fn score_bool_value(neg: bool, v: &Value) -> R {
+    if neg {
+        score_bool_neg(v)
+    } else {
+        score_bool(v)
+    }
+}
+
 fn score_negation(c: &R, asn: &Assignment, env: &[(String, Value)], inner: &Sexp) -> R {
     if let Sexp::List(items) = inner {
         let a = || ev(&items[1], asn, env);
