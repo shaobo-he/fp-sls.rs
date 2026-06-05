@@ -127,8 +127,16 @@ enum Node {
 
 pub struct Dag {
     nodes: Vec<Node>,
-    roots: Vec<Id>,    // top-level asserts
-    vars: Vec<String>, // var index -> name
+    roots: Vec<Id>,            // top-level asserts
+    vars: Vec<String>,         // var index -> name
+    assert_vars: Vec<Vec<u32>>, // per assert: the var indices it depends on (sorted)
+}
+
+/// Reusable evaluation buffers (one [`Value`] / [`Rational`] cache slot per node),
+/// so the move-scoring hot loop allocates nothing per neighbor.
+pub struct Scorer {
+    val: Vec<Option<Value>>,
+    scr: Vec<Option<Rational>>,
 }
 
 /// `let` scope: term bindings map to a shared node id; boolean bindings are kept
@@ -485,11 +493,53 @@ impl Dag {
             Node::And(ch) => ch.clone(),
             _ => vec![root],
         };
-        Dag {
+        let mut dag = Dag {
             nodes: b.nodes,
             roots,
             vars: b.vars,
-        }
+            assert_vars: Vec::new(),
+        };
+        dag.assert_vars = dag.compute_assert_vars();
+        dag
+    }
+
+    /// For each assert (root), the sorted var indices in its cone.
+    fn compute_assert_vars(&self) -> Vec<Vec<u32>> {
+        let mut seen = vec![false; self.nodes.len()];
+        let mut visited: Vec<Id> = Vec::new();
+        self.roots
+            .iter()
+            .map(|&r| {
+                let mut vars = Vec::new();
+                let mut stack = vec![r];
+                visited.clear();
+                while let Some(id) = stack.pop() {
+                    if seen[id as usize] {
+                        continue;
+                    }
+                    seen[id as usize] = true;
+                    visited.push(id);
+                    match &self.nodes[id as usize] {
+                        Node::Var(idx) => vars.push(*idx),
+                        Node::Const(_) | Node::True | Node::False => {}
+                        Node::Term(_, ch) | Node::And(ch) | Node::Or(ch) => stack.extend(ch),
+                        Node::AtomNode(_, _, a, b) => {
+                            stack.push(*a);
+                            stack.push(*b);
+                        }
+                        Node::BoolTerm(_, t) => stack.push(*t),
+                    }
+                }
+                // reset `seen` for the nodes this assert visited, so the next
+                // assert re-traverses shared subterms (otherwise it misses vars).
+                for &v in &visited {
+                    seen[v as usize] = false;
+                }
+                vars.sort_unstable();
+                vars.dedup();
+                vars
+            })
+            .collect()
     }
 
     pub fn num_nodes(&self) -> usize {
@@ -502,17 +552,60 @@ impl Dag {
         self.roots.len()
     }
 
-    /// Per-assert scores under `asn` (full bottom-up evaluation with caching).
-    pub fn assert_scores(&self, c: &Rational, asn: &Assignment) -> Vec<Rational> {
-        let n = self.nodes.len();
-        let mut val: Vec<Option<Value>> = vec![None; n];
-        let mut scr: Vec<Option<Rational>> = vec![None; n];
-        for id in 0..n {
-            self.eval_node(id, asn, c, &mut val, &mut scr);
+    /// A fresh evaluation buffer for this DAG (reused across move scorings).
+    pub fn scorer(&self) -> Scorer {
+        Scorer {
+            val: vec![None; self.nodes.len()],
+            scr: vec![None; self.nodes.len()],
+        }
+    }
+
+    /// Per-assert scores under `asn`, into the reusable `s` (allocation-free in
+    /// the hot loop). Full bottom-up evaluation: each node computed once.
+    pub fn eval_into(&self, c: &Rational, asn: &Assignment, s: &mut Scorer) -> Vec<Rational> {
+        for id in 0..self.nodes.len() {
+            self.eval_node(id, asn, c, &mut s.val, &mut s.scr);
         }
         self.roots
             .iter()
-            .map(|&r| scr[r as usize].clone().expect("root scored"))
+            .map(|&r| s.scr[r as usize].clone().expect("root scored"))
+            .collect()
+    }
+
+    /// Per-assert scores under `asn` (convenience; allocates a throwaway buffer).
+    pub fn assert_scores(&self, c: &Rational, asn: &Assignment) -> Vec<Rational> {
+        let mut s = self.scorer();
+        self.eval_into(c, asn, &mut s)
+    }
+
+    /// The variable names that assert `i` depends on.
+    pub fn assert_var_names(&self, i: usize) -> Vec<&str> {
+        self.assert_vars[i]
+            .iter()
+            .map(|&v| self.vars[v as usize].as_str())
+            .collect()
+    }
+
+    /// `(assert (= const var))` for every variable reachable in the formula,
+    /// matching `sls::get_models`.
+    pub fn models(&self, asn: &Assignment) -> Vec<Sexp> {
+        let mut idxs: Vec<u32> = self.assert_vars.iter().flatten().copied().collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        let mut names: Vec<&String> = idxs.iter().map(|&i| &self.vars[i as usize]).collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let cst = match asn.get(name).expect("model var") {
+                    Value::BV(b) => b.to_bv_const(),
+                    Value::FP(f) => f.to_fp_const(),
+                };
+                Sexp::List(vec![
+                    Sexp::sym("assert"),
+                    Sexp::List(vec![Sexp::sym("="), cst, Sexp::sym(name.clone())]),
+                ])
+            })
             .collect()
     }
 
