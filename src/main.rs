@@ -2,7 +2,7 @@
 
 use fp_sls::data::fp::ROUNDING_MODES;
 use fp_sls::data::value::Assignment;
-use fp_sls::parsing::parse::{get_var_info, prepare_formula, rounding_mode_type};
+use fp_sls::parsing::parse::{get_formula, get_var_info, rounding_mode_type};
 use fp_sls::parsing::reader::{read_all, read_file};
 use fp_sls::parsing::transform::substitute;
 use fp_sls::rng::Rng;
@@ -208,7 +208,10 @@ fn main() {
         std::process::exit(1);
     });
 
-    let formula = prepare_formula(&cmds);
+    // `get_formula` only (no `prepare_formula`): the DAG does NNF, constant
+    // folding and let-resolution itself, so we skip the pipeline passes that
+    // deep-clone z3's million-node let-shared output and OOM.
+    let formula = get_formula(&cmds);
     let full_var_info = get_var_info(&cmds);
 
     // Split off RoundingMode variables: they are not searched but enumerated
@@ -224,6 +227,40 @@ fn main() {
         var_info.remove(v);
     }
 
+    // Build the DAG and search on a large stack: the recursive DAG build
+    // descends to the formula's nesting depth, which is large for z3's
+    // let-shared output and would overflow the default 8 MB main stack.
+    let print_models = opts.print_models;
+    let result = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || solve(formula, var_info, rm_vars, opts, input_file))
+        .expect("spawn solver thread")
+        .join()
+        .expect("solver thread panicked");
+
+    match result {
+        SolveResult::Sat(models) => {
+            println!("sat");
+            if print_models {
+                for m in models {
+                    println!("{m}");
+                }
+            }
+        }
+        SolveResult::Unknown => println!("unknown"),
+    }
+}
+
+/// Build the initial model, run the chosen SLS strategy, and (when the formula
+/// has free `RoundingMode` variables) enumerate the five rounding-mode constants
+/// in their place. Runs on its own large-stack thread (see the call site).
+fn solve(
+    formula: Sexp,
+    var_info: VarInfo,
+    rm_vars: Vec<String>,
+    opts: Options,
+    input_file: String,
+) -> SolveResult {
     let mut rng = Rng::from_seed(opts.seed);
 
     // Initial model over the *search* variables (excludes RoundingMode).
@@ -258,53 +295,39 @@ fn main() {
         }
     };
 
-    let result = if rm_vars.is_empty() {
-        run(&formula, initial, &mut rng)
-    } else {
-        // Enumerate the 5^k rounding-mode combinations; combo 0 is all-RNE
-        // (ROUNDING_MODES[0]), so the IEEE-default case is tried first.
-        let k = rm_vars.len();
-        let total = 5u64.checked_pow(k as u32).unwrap_or(u64::MAX);
-        let cap = 10_000u64;
-        let limit = total.min(cap);
-        if total > cap {
-            eprintln!("warning: {k} RoundingMode variables → {total} combinations; trying {cap}");
-        }
-        let mut outcome = SolveResult::Unknown;
-        for idx in 0..limit {
-            let mut subs: HashMap<String, String> = HashMap::new();
-            let mut chosen: Vec<&str> = Vec::with_capacity(k);
-            let mut x = idx;
-            for v in &rm_vars {
-                let d = (x % 5) as usize;
-                x /= 5;
-                subs.insert(v.clone(), ROUNDING_MODES[d].to_string());
-                chosen.push(ROUNDING_MODES[d]);
-            }
-            let f = substitute(&formula, &subs);
-            if let SolveResult::Sat(mut models) = run(&f, initial.clone(), &mut rng) {
-                for (v, m) in rm_vars.iter().zip(&chosen) {
-                    models.push(Sexp::List(vec![
-                        Sexp::sym("assert"),
-                        Sexp::List(vec![Sexp::sym("="), Sexp::sym(*m), Sexp::sym(v.clone())]),
-                    ]));
-                }
-                outcome = SolveResult::Sat(models);
-                break;
-            }
-        }
-        outcome
-    };
-
-    match result {
-        SolveResult::Sat(models) => {
-            println!("sat");
-            if opts.print_models {
-                for m in models {
-                    println!("{m}");
-                }
-            }
-        }
-        SolveResult::Unknown => println!("unknown"),
+    if rm_vars.is_empty() {
+        return run(&formula, initial, &mut rng);
     }
+
+    // Enumerate the 5^k rounding-mode combinations; combo 0 is all-RNE
+    // (ROUNDING_MODES[0]), so the IEEE-default case is tried first.
+    let k = rm_vars.len();
+    let total = 5u64.checked_pow(k as u32).unwrap_or(u64::MAX);
+    let cap = 10_000u64;
+    let limit = total.min(cap);
+    if total > cap {
+        eprintln!("warning: {k} RoundingMode variables → {total} combinations; trying {cap}");
+    }
+    for idx in 0..limit {
+        let mut subs: HashMap<String, String> = HashMap::new();
+        let mut chosen: Vec<&str> = Vec::with_capacity(k);
+        let mut x = idx;
+        for v in &rm_vars {
+            let d = (x % 5) as usize;
+            x /= 5;
+            subs.insert(v.clone(), ROUNDING_MODES[d].to_string());
+            chosen.push(ROUNDING_MODES[d]);
+        }
+        let f = substitute(&formula, &subs);
+        if let SolveResult::Sat(mut models) = run(&f, initial.clone(), &mut rng) {
+            for (v, m) in rm_vars.iter().zip(&chosen) {
+                models.push(Sexp::List(vec![
+                    Sexp::sym("assert"),
+                    Sexp::List(vec![Sexp::sym("="), Sexp::sym(*m), Sexp::sym(v.clone())]),
+                ]));
+            }
+            return SolveResult::Sat(models);
+        }
+    }
+    SolveResult::Unknown
 }

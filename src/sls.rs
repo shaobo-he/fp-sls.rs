@@ -8,6 +8,11 @@
 //!
 //! Both are written as explicit loops (the Racket version recurses; Rust would
 //! overflow the stack for large `max_steps`).
+//!
+//! Scoring goes through the hash-consed [`Dag`]: each strategy builds the DAG
+//! once from the formula `f` (collapsing z3's let-sharing — see [`crate::dag`])
+//! and then scores every candidate move against it, mutating the single live
+//! assignment in place rather than cloning it.
 
 // Several `argmax`/weight loops index in parallel and must keep "first on ties"
 // semantics, which reads more clearly as an indexed loop than an iterator chain.
@@ -17,15 +22,12 @@ use crate::data::bitvec::BitVec;
 use crate::data::eval::get_value;
 use crate::data::fp::FloatingPoint;
 use crate::data::value::{Assignment, Value};
-use crate::parsing::parse::{
-    bool_type, bv_type, bv_type_width, fp_type, fp_type_widths, get_assertions, get_reachable_vars,
-    get_vars, Type,
-};
+use crate::dag::{Dag, Scorer};
+use crate::parsing::parse::{bool_type, bv_type, bv_type_width, fp_type, fp_type_widths, Type};
 use crate::rng::Rng;
-use crate::score::score;
 use crate::sexp::Sexp;
 use rug::Rational;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub type VarInfo = HashMap<String, Type>;
 
@@ -101,47 +103,10 @@ pub fn randomize_assignment(var_info: &VarInfo, rng: &mut Rng) -> Assignment {
     asn
 }
 
-// ---------- model extraction ----------
-
-fn value_to_const(v: &Value) -> Sexp {
-    match v {
-        Value::BV(b) => b.to_bv_const(),
-        Value::FP(f) => f.to_fp_const(),
-    }
-}
-
-/// `(get/models assignment asserts)` — `(assert (= const var))` for each
-/// reachable variable.
-pub fn get_models(asn: &Assignment, asserts: &[Sexp]) -> Vec<Sexp> {
-    let mut reachable: HashSet<String> = HashSet::new();
-    for a in asserts {
-        reachable.extend(get_reachable_vars(a, asn));
-    }
-    let mut names: Vec<&String> = asn.keys().filter(|k| reachable.contains(*k)).collect();
-    names.sort();
-    names
-        .into_iter()
-        .map(|name| {
-            Sexp::List(vec![
-                Sexp::sym("assert"),
-                Sexp::List(vec![
-                    Sexp::sym("="),
-                    value_to_const(&asn[name]),
-                    Sexp::sym(name.clone()),
-                ]),
-            ])
-        })
-        .collect()
-}
-
 // ---------- shared helpers ----------
 
 fn one() -> Rational {
     Rational::from(1)
-}
-
-fn formula_score(c2: &Rational, asn: &Assignment, f: &Sexp) -> Rational {
-    score(c2, asn, &[], f)
 }
 
 fn average(scores: &[Rational]) -> Rational {
@@ -152,8 +117,13 @@ fn average(scores: &[Rational]) -> Rational {
     sum / Rational::from(scores.len() as u32)
 }
 
-/// `(select/Assertion …)` — the highest-scoring *unsatisfied* assertion.
-fn select_assertion<'a>(asserts: &'a [Sexp], scores: &[Rational]) -> &'a Sexp {
+fn all_satisfied(scores: &[Rational]) -> bool {
+    let one = one();
+    scores.iter().all(|s| *s == one)
+}
+
+/// `(select/Assertion …)` — index of the highest-scoring *unsatisfied* assertion.
+fn select_assertion_idx(scores: &[Rational]) -> usize {
     let key = |s: &Rational| -> Rational {
         if *s < one() {
             s.clone()
@@ -170,29 +140,27 @@ fn select_assertion<'a>(asserts: &'a [Sexp], scores: &[Rational]) -> &'a Sexp {
             best = i;
         }
     }
-    &asserts[best]
+    best
 }
 
-/// Score `f` as if `var := nv`, then restore `asn` to its prior state.
-///
-/// This avoids materializing a neighbor assignment: the single live assignment
-/// is mutated in place and reverted, so each neighbor costs O(1) memory instead
-/// of a full map clone. (The Racket original got the same effect from persistent
-/// immutable hashes; this is the in-place equivalent and selects the identical
-/// move, since the score of "α with one variable changed" is unchanged.)
-fn score_with_move(c2: &Rational, asn: &mut Assignment, f: &Sexp, var: &str, nv: &Value) -> Rational {
+/// Per-assert scores as if `var := nv`, then restore `asn`. Avoids materializing
+/// a neighbor assignment: the single live assignment is mutated in place and
+/// reverted, and scored against the (cached) DAG.
+fn eval_with_move(
+    dag: &Dag,
+    c: &Rational,
+    asn: &mut Assignment,
+    sc: &mut Scorer,
+    var: &str,
+    nv: &Value,
+) -> Vec<Rational> {
     let old = std::mem::replace(
         asn.get_mut(var).expect("candidate variable present in assignment"),
         nv.clone(),
     );
-    let s = formula_score(c2, asn, f);
+    let scores = dag.eval_into(c, asn, sc);
     *asn.get_mut(var).expect("candidate variable present in assignment") = old;
-    s
-}
-
-fn all_satisfied(scores: &[Rational]) -> bool {
-    let one = one();
-    scores.iter().all(|s| *s == one)
+    scores
 }
 
 // ---------- WalkSAT-style SLS ----------
@@ -204,33 +172,31 @@ pub fn sls(
     mut assignment: Assignment,
     rng: &mut Rng,
 ) -> SolveResult {
-    let asserts = get_assertions(f);
+    let dag = Dag::build(f, var_info);
+    let mut sc = dag.scorer();
     for step in 0..params.max_steps {
-        let assert_scores: Vec<Rational> = asserts
-            .iter()
-            .map(|a| formula_score(&params.c2, &assignment, a))
-            .collect();
+        let assert_scores = dag.eval_into(&params.c2, &assignment, &mut sc);
         if all_satisfied(&assert_scores) {
             if params.stats {
                 eprintln!("steps {step}");
             }
-            return SolveResult::Sat(get_models(&assignment, &asserts));
+            return SolveResult::Sat(dag.models(&assignment));
         }
 
         let curr_score = average(&assert_scores);
         if params.debug {
             eprintln!("[sls] step {step}: score {:.6}", curr_score.to_f64());
         }
-        let cand = select_assertion(&asserts, &assert_scores);
-        let cand_vars = get_vars(cand, &assignment);
+        let cand_idx = select_assertion_idx(&assert_scores);
+        let cand_vars = dag.assert_var_names(cand_idx);
 
         // Extended neighborhood of every candidate variable, as cheap
         // `(var, value)` moves scored in place (no per-neighbor assignment copy).
         let mut moves: Vec<(&str, Value)> = Vec::new();
-        for var in &cand_vars {
+        for &var in &cand_vars {
             let val = get_value(&assignment, var).clone();
             for nv in extended_neighbor_values(&val, rng) {
-                moves.push((var.as_str(), nv));
+                moves.push((var, nv));
             }
         }
 
@@ -245,10 +211,13 @@ pub fn sls(
         } else {
             // Highest-scoring move (first on ties), scored via mutate-and-revert.
             let mut best = 0;
-            let mut best_score =
-                score_with_move(&params.c2, &mut assignment, f, moves[0].0, &moves[0].1);
+            let mut best_score = average(&eval_with_move(
+                &dag, &params.c2, &mut assignment, &mut sc, moves[0].0, &moves[0].1,
+            ));
             for i in 1..moves.len() {
-                let s = score_with_move(&params.c2, &mut assignment, f, moves[i].0, &moves[i].1);
+                let s = average(&eval_with_move(
+                    &dag, &params.c2, &mut assignment, &mut sc, moves[i].0, &moves[i].1,
+                ));
                 if s > best_score {
                     best_score = s;
                     best = i;
@@ -284,33 +253,31 @@ pub fn sls_vns(
     mut assignment: Assignment,
     rng: &mut Rng,
 ) -> SolveResult {
-    let asserts = get_assertions(f);
+    let dag = Dag::build(f, var_info);
+    let mut sc = dag.scorer();
     let nc = 3u32;
     let mut ni = 1u32;
     for step in 0..params.max_steps {
-        let assert_scores: Vec<Rational> = asserts
-            .iter()
-            .map(|a| formula_score(&params.c2, &assignment, a))
-            .collect();
+        let assert_scores = dag.eval_into(&params.c2, &assignment, &mut sc);
         if all_satisfied(&assert_scores) {
             if params.stats {
                 eprintln!("steps {step}");
             }
-            return SolveResult::Sat(get_models(&assignment, &asserts));
+            return SolveResult::Sat(dag.models(&assignment));
         }
 
         let curr_score = average(&assert_scores);
         if params.debug {
             eprintln!("[vns] step {step} (ni={ni}): score {:.6}", curr_score.to_f64());
         }
-        let cand = select_assertion(&asserts, &assert_scores);
-        let cand_vars = get_vars(cand, &assignment);
+        let cand_idx = select_assertion_idx(&assert_scores);
+        let cand_vars = dag.assert_var_names(cand_idx);
 
         let mut moves: Vec<(&str, Value)> = Vec::new();
-        for var in &cand_vars {
+        for &var in &cand_vars {
             let val = get_value(&assignment, var).clone();
             for nv in vns_neighbor_values(&val, ni, rng) {
-                moves.push((var.as_str(), nv));
+                moves.push((var, nv));
             }
         }
 
@@ -318,10 +285,13 @@ pub fn sls_vns(
             None
         } else {
             let mut best = 0;
-            let mut best_score =
-                score_with_move(&params.c2, &mut assignment, f, moves[0].0, &moves[0].1);
+            let mut best_score = average(&eval_with_move(
+                &dag, &params.c2, &mut assignment, &mut sc, moves[0].0, &moves[0].1,
+            ));
             for i in 1..moves.len() {
-                let s = score_with_move(&params.c2, &mut assignment, f, moves[i].0, &moves[i].1);
+                let s = average(&eval_with_move(
+                    &dag, &params.c2, &mut assignment, &mut sc, moves[i].0, &moves[i].1,
+                ));
                 if s > best_score {
                     best_score = s;
                     best = i;
@@ -364,8 +334,6 @@ pub fn sls_vns(
 //   * UCB-style assertion selection (Agrawal 1995);
 //   * additive PAWS assertion weighting (Thornton et al. 2004);
 //   * an exponential (Luby-like) restart schedule.
-// Paper default constants are used; the score-scaling constant `c1` comes from
-// `params.c2` (OL1V3R's `--c2`).
 
 /// Paper UCB exploration constant `c2`.
 const UCB_C2: f64 = 20.0;
@@ -418,26 +386,6 @@ fn select_assertion_ucb(assert_scores: &[Rational], selected: &[u64], moves: u64
     best.expect("at least one unsatisfied assertion")
 }
 
-/// Weighted score of `f`'s assertions as if `var := nv`, then restore `asn`
-/// (the in-place analogue of [`score_with_move`] for the heuristics search).
-fn weighted_score_with_move(
-    c2: &Rational,
-    weights: &[Rational],
-    asserts: &[Sexp],
-    asn: &mut Assignment,
-    var: &str,
-    nv: &Value,
-) -> Rational {
-    let old = std::mem::replace(
-        asn.get_mut(var).expect("candidate variable present in assignment"),
-        nv.clone(),
-    );
-    let scores: Vec<Rational> = asserts.iter().map(|x| formula_score(c2, asn, x)).collect();
-    let w = weighted_score(weights, &scores);
-    *asn.get_mut(var).expect("candidate variable present in assignment") = old;
-    w
-}
-
 /// WalkSAT search augmented with the paper's heuristics. `initial` seeds the
 /// first round; restarts re-randomize the assignment while retaining the
 /// assertion weights and UCB statistics.
@@ -448,8 +396,9 @@ pub fn sls_heuristics(
     initial: Assignment,
     rng: &mut Rng,
 ) -> SolveResult {
-    let asserts = get_assertions(f);
-    let n = asserts.len();
+    let dag = Dag::build(f, var_info);
+    let mut sc = dag.scorer();
+    let n = dag.num_asserts();
     let mut weights = vec![Rational::from(1); n];
     let mut selected = vec![0u64; n];
     let mut moves: u64 = 0;
@@ -465,15 +414,12 @@ pub fn sls_heuristics(
 
         for _ in 0..round_steps {
             moves += 1;
-            let assert_scores: Vec<Rational> = asserts
-                .iter()
-                .map(|a| formula_score(&params.c2, &assignment, a))
-                .collect();
+            let assert_scores = dag.eval_into(&params.c2, &assignment, &mut sc);
             if all_satisfied(&assert_scores) {
                 if params.stats {
                     eprintln!("steps {moves}");
                 }
-                return SolveResult::Sat(get_models(&assignment, &asserts));
+                return SolveResult::Sat(dag.models(&assignment));
             }
 
             let cand_idx = select_assertion_ucb(&assert_scores, &selected, moves);
@@ -482,28 +428,36 @@ pub fn sls_heuristics(
             if params.debug {
                 eprintln!("[heur] move {moves} round {round}: wscore {:.4}", curr_w.to_f64());
             }
-            let cand_vars = get_vars(&asserts[cand_idx], &assignment);
+            let cand_vars = dag.assert_var_names(cand_idx);
 
-            let mut moves: Vec<(&str, Value)> = Vec::new();
-            for var in &cand_vars {
+            let mut moves_list: Vec<(&str, Value)> = Vec::new();
+            for &var in &cand_vars {
                 let val = get_value(&assignment, var).clone();
                 for nv in extended_neighbor_values(&val, rng) {
-                    moves.push((var.as_str(), nv));
+                    moves_list.push((var, nv));
                 }
             }
 
-            let chosen: Option<usize> = if moves.is_empty() {
+            let chosen: Option<usize> = if moves_list.is_empty() {
                 None
             } else if rng.coin_flip(params.wp) {
-                Some(rng.below(moves.len()))
+                Some(rng.below(moves_list.len()))
             } else {
                 let mut best = 0;
-                let mut best_w = weighted_score_with_move(
-                    &params.c2, &weights, &asserts, &mut assignment, moves[0].0, &moves[0].1,
+                let mut best_w = weighted_score(
+                    &weights,
+                    &eval_with_move(
+                        &dag, &params.c2, &mut assignment, &mut sc, moves_list[0].0,
+                        &moves_list[0].1,
+                    ),
                 );
-                for i in 1..moves.len() {
-                    let w = weighted_score_with_move(
-                        &params.c2, &weights, &asserts, &mut assignment, moves[i].0, &moves[i].1,
+                for i in 1..moves_list.len() {
+                    let w = weighted_score(
+                        &weights,
+                        &eval_with_move(
+                            &dag, &params.c2, &mut assignment, &mut sc, moves_list[i].0,
+                            &moves_list[i].1,
+                        ),
                     );
                     if w > best_w {
                         best_w = w;
@@ -519,8 +473,8 @@ pub fn sls_heuristics(
 
             match chosen {
                 Some(i) => {
-                    let var = moves[i].0;
-                    let nv = moves[i].1.clone();
+                    let var = moves_list[i].0;
+                    let nv = moves_list[i].1.clone();
                     *assignment
                         .get_mut(var)
                         .expect("candidate variable present in assignment") = nv;
