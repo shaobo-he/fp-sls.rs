@@ -143,7 +143,9 @@ specific witness — solvable at a larger `--step` budget); the single `error` i
 
 `bench/compare_racket.sh <dir> [step] [seed] [timeout] [jobs]` runs this port and
 the original Racket OL1V3R (compiled with `raco make`) on the same files, same
-`--step`/`--seed`. **Baseline vs baseline** on the 51-file set:
+flags and `--step`/`--seed`.
+
+**Baseline vs baseline** (no flags), 51-file set:
 
 * **Same answers** — both solve the same instances (small differences are
   random-seed luck at a fixed step budget; the two use different RNGs).
@@ -154,16 +156,21 @@ the original Racket OL1V3R (compiled with `raco make`) on the same files, same
   `test_v3_r8_vr10…`: 0.72 s vs 14.2 s) — compiled Rust + GMP rationals vs the
   Racket VM, same algorithm and same MPFR backend.
 
+**All shared flags** (`--vns --elim-eqs --try-real-models`) on both: the two
+tools **agree on 50/51** (the 51st is `protected_divide`, which uses `ite` —
+both fail), mean **0.03 s (Rust) vs 0.62 s (Racket)**. This required a
+z3-compatibility fix to the Racket original, whose z3-output parsing predated
+current z3 (`get-model` model format, the `/0` division function, and inputs
+without `(check-sat)`); the fix is merged upstream into
+[soarlab/OL1V3R](https://github.com/soarlab/OL1V3R). `src/z3.rs` here carries the
+analogous `--elim-eqs` soundness fix.
+
 Notes on a fully like-for-like comparison:
 
 * `--heuristics` exists **only in this port** (it implements the Racket repo's
   proposed-but-unimplemented future work), so it is excluded from parity runs.
 * `--vns` is an alternative neighborhood strategy, not a strict speed-up — on
   this set it solves slightly fewer instances than the default within a budget.
-* The Racket `--try-real-models` model parser was written for z3 ≈4.8 and errors
-  on z3 4.16's `get-model` output (`unsupported model`); this port's parser
-  handles the current format. So that flag cannot be compared at parity without
-  an older z3. `--elim-eqs` works for both.
 
 ## Testing
 
