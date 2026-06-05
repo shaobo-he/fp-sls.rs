@@ -181,11 +181,18 @@ fn apply_z3_tactic(path: &str, tactic: &str, tag: &str) -> std::io::Result<std::
         .filter(|e| matches!(e.head_sym(), Some("declare-const") | Some("declare-fun")))
         .collect();
 
+    // Strip the trailing solver commands and append the tactic application.
+    // We must remove `(exit)` (and `(get-model)` etc.) too, not just
+    // `(check-sat)`: many SMT-LIB files end with `(check-sat) (exit)`, and a
+    // leftover `(exit)` makes z3 quit *before* reaching the appended tactic
+    // (producing empty output and a silent fallback to the unsimplified file).
+    let stripped = raw
+        .replace("(check-sat)", "")
+        .replace("(exit)", "")
+        .replace("(get-model)", "")
+        .replace("(get-unsat-core)", "");
     let tactic_file = temp_path(&format!("{tag}-in"));
-    std::fs::write(
-        &tactic_file,
-        format!("{}\n(apply {tactic})\n", raw.replace("(check-sat)", "")),
-    )?;
+    std::fs::write(&tactic_file, format!("{stripped}\n(apply {tactic})\n"))?;
     // If z3 is unavailable, transparently fall back to the original file.
     let output = match run_z3(&tactic_file) {
         Ok(o) => o,
