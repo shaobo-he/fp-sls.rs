@@ -84,6 +84,7 @@ The module layout mirrors the Racket repository for traceability:
 | `src/data/eval.rs` | `data/eval.rkt` | term evaluator |
 | `src/data/value.rs` | — | the `BV \| FP` runtime value |
 | `src/score.rs` | `score.rkt` | the scoring function |
+| `src/dag.rs` | — | hash-consed formula DAG for compact, cached scoring |
 | `src/sls.rs` | `sls.rkt` | the SLS / VNS / heuristic search loops |
 | `src/parsing/reader.rs` | reader in `parsing/parse.rkt` | SMT-LIB s-expression reader |
 | `src/parsing/parse.rs` | `parsing/parse.rkt` | assertions, types, variable collection |
@@ -103,6 +104,14 @@ The module layout mirrors the Racket repository for traceability:
   functions (they should be rational rather than floating point)"*.
 * **Reproducibility.** `--seed` seeds a `StdRng`; runs are deterministic for a
   fixed seed (but do not bit-match Racket's generator).
+* **Hash-consed scoring DAG.** z3's `simplify` can emit a heavily `let`-shared
+  formula — millions of `Sexp` nodes for deeply-unrolled benchmarks. `src/dag.rs`
+  builds it once into a compact node array, resolving each `let` reference to a
+  shared node id instead of re-expanding the tree (a 1.2 M-node tree collapses to
+  ~2,800 distinct nodes). The search scores moves against this DAG, mutating the
+  single live assignment in place — which removes a preprocessing memory blow-up
+  and makes the large `sin`/`gaussian` instances tractable. Scores are identical
+  to the recursive `score.rs` (a test cross-checks them).
 
 ## Addressing `TODOs.md`
 
@@ -155,6 +164,41 @@ satisfiable instances. Where both return a definitive `sat`, they agree.
 The single `unknown` is `average_6.smt2` (a precision counterexample needing a
 specific witness — solvable at a larger `--step` budget); the single `error` is
 `protected_divide.smt2`, which uses `ite` (see [Limitations](#limitations)).
+
+### SMT-COMP 2025 QF_FP (single-query)
+
+Evaluated on the SMT-COMP 2025 QF_FP single-query set. The competition set is 275
+benchmarks; since this is a *satisfiability-only* SLS solver (it finds models, it
+cannot prove `unsat`), the 124 `unsat` instances are removed, leaving **151**
+(147 `sat` + 4 `unknown`, per the competition status). Run with all flags
+(`--heuristics --elim-eqs --try-real-models`), **15 min / 4 GB per benchmark**,
+in parallel, each benchmark sandboxed in its own cgroup:
+
+```
+solved 139 / 147 satisfiable  (95%)
++ found models for 2 of the 4 competition-"unknown" instances (proving them sat)
+= 141 sat,  9 timeout,  1 error
+```
+
+**Every one of the 141 models was independently validated by cvc5** — re-checked
+against the *original* formula (cvc5 is independent of the z3 used only for
+preprocessing). All 141 returned `sat`: **zero spurious models**, confirming the
+search, the z3 simplification chain, the rounding-mode handling and the model
+output are sound end-to-end.
+
+The 8 satisfiable misses are `protected_divide` (an `ite` over FP variables —
+unsupported, see [Limitations](#limitations)), six heavily-unrolled `sin`/`sin2`
+instances, and one large `test_v7…`. The sine instances are where the hash-consed
+[DAG](#architecture) is essential: z3's `simplify` emits them as ~1.2 M-node
+`let`-shared trees, which the DAG collapses to ~2,800 distinct nodes — so they run
+in a few hundred MB instead of exhausting memory.
+
+For context, the SMT-COMP 2024/2025 leaders solved **136–142 satisfiable**
+instances each (cvc5 139/142, Bitwuzla 136/140) on the full 275-benchmark mix at
+**20 min / 20–30 GB**. This port's **139 SAT** sits in that same band on a tighter
+budget — but it is sat-only, so on *total* solved (sat + unsat) a complete solver
+like Bitwuzla (255) is out of reach, and the satisfiable subsets are not
+byte-identical, so this is a ballpark comparison, not a head-to-head.
 
 ### Comparison with the Racket original
 
