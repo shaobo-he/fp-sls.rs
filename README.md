@@ -26,10 +26,10 @@ and `make`. Then:
 cargo build --release
 ```
 
-The binary is `target/release/fp-sls`. The `--try-real-models` and `--elim-eqs`
-options additionally shell out to a [`z3`](https://github.com/Z3Prover/z3) binary
-on `PATH`; without it they degrade gracefully (a warning, then the default
-behaviour).
+The binary is `target/release/fp-sls`. The default simplification preprocessing
+(see [below](#preprocessing-no-jfs-dependency)) and the `--try-real-models` /
+`--elim-eqs` options shell out to a [`z3`](https://github.com/Z3Prover/z3) binary
+on `PATH`; without it they degrade gracefully (the raw input is used).
 
 ## Usage
 
@@ -44,13 +44,30 @@ fp-sls [options] <file.smt2>
   --try-real-models          seed search from a Z3 real-relaxation model
   --vns                      use variable-neighborhood search
   --heuristics               use the paper's heuristics (UCB + PAWS + restarts)
-  --elim-eqs                 preprocess with Z3's solve-eqs tactic
+  --no-simplify              skip the default z3 simplification (jfs-opt equivalent)
+  --elim-eqs                 also preprocess with Z3's solve-eqs tactic
   --print-models             print the model when sat
   --debug                    log per-step score to stderr
+  --stats                    print `steps <n>` to stderr on a sat result
 ```
 
 It prints `sat` (optionally followed by the model) or `unknown`. As an
 incomplete solver it never reports `unsat`.
+
+### Preprocessing (no JFS dependency)
+
+By default the input is simplified with z3 before search. The NSV'19 paper
+preprocessed benchmarks with JFS's `jfs-opt` tool; that tool's standard pipeline
+is really just two z3 tactics — `simplify` (with `bv_ite2id=true`) and
+`propagate-values` — with the remaining passes (and-hoist, true/duplicate
+elimination, contradiction→false) performed for free by z3's `(apply …)`
+machinery. So we reproduce `jfs-opt` with a single z3 tactic and **no JFS (LLVM/
+clang) build**: strip `(check-sat)`, apply
+`(then (! simplify :bv_ite2id true) propagate-values …)`, and rebuild the query
+from the resulting goal. This is on by default (disable with `--no-simplify`),
+folds away constructs the evaluator doesn't handle natively (e.g. a constant
+`ite`), and uses `propagate-values` rather than `solve-eqs` so no declared
+variable is substituted away. It falls back to the raw input if z3 is absent.
 
 ```sh
 fp-sls --step 10000 --print-models tests/smt/schanda/spark/incorrect_reordering.smt2

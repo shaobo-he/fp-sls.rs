@@ -152,9 +152,28 @@ pub fn real_model_to_fp_model(real_model: &HashMapRat, var_info: &VarInfo) -> As
     asn
 }
 
-/// `(eliminate-eqs file)` — run Z3's `solve-eqs` tactic and return the path to a
-/// rewritten SMT-LIB file (declarations + simplified asserts + check-sat).
-pub fn eliminate_eqs(path: &str) -> std::io::Result<std::path::PathBuf> {
+/// The `jfs-opt --standard-passes` pipeline, reproduced with z3 tactics alone.
+///
+/// JFS's `SimplificationPass` is z3's `simplify` (with `bv_ite2id=true`) and its
+/// `ConstantPropagationPass` is z3's `propagate-values`; the other standard
+/// passes (and-hoist, true/duplicate-constraint elimination, contradiction→
+/// false) are performed for free by z3's goal/`(apply …)` machinery. So a single
+/// `(apply (then …))` reproduces the whole pipeline — no JFS (LLVM/clang) build
+/// needed. (`propagate-values`, not `solve-eqs`, so no declared variable is
+/// substituted away.)
+pub const JFS_OPT_TACTIC: &str = "(then (! simplify :bv_ite2id true) \
+                                  propagate-values \
+                                  (! simplify :bv_ite2id true) \
+                                  propagate-values \
+                                  (! simplify :bv_ite2id true))";
+
+/// Apply a z3 tactic to a query and return the path to a rewritten SMT-LIB file
+/// (original declarations + the resulting goal's literals + check-sat).
+///
+/// Robust to inputs without `(check-sat)` (some QF_FP files omit it) and to z3
+/// being unavailable or emitting an unexpected result — in those cases it falls
+/// back to the original file rather than dropping constraints.
+fn apply_z3_tactic(path: &str, tactic: &str, tag: &str) -> std::io::Result<std::path::PathBuf> {
     let raw = std::fs::read_to_string(path)?;
     let cmds = read_all(&raw);
     let decls: Vec<&Sexp> = cmds
@@ -162,20 +181,24 @@ pub fn eliminate_eqs(path: &str) -> std::io::Result<std::path::PathBuf> {
         .filter(|e| matches!(e.head_sym(), Some("declare-const") | Some("declare-fun")))
         .collect();
 
-    // Strip any (check-sat) and append the tactic application. (Some QF_FP
-    // files omit (check-sat) entirely; a plain `replace("check-sat", …)` would
-    // then leave no command and z3 would emit nothing.)
-    let tactic_file = temp_path("solveeqs-in");
+    let tactic_file = temp_path(&format!("{tag}-in"));
     std::fs::write(
         &tactic_file,
-        format!("{}\n(apply solve-eqs)\n", raw.replace("(check-sat)", "")),
+        format!("{}\n(apply {tactic})\n", raw.replace("(check-sat)", "")),
     )?;
-    let output = run_z3(&tactic_file)?;
+    // If z3 is unavailable, transparently fall back to the original file.
+    let output = match run_z3(&tactic_file) {
+        Ok(o) => o,
+        Err(_) => {
+            let _ = std::fs::remove_file(&tactic_file);
+            return Ok(std::path::PathBuf::from(path));
+        }
+    };
     let _ = std::fs::remove_file(&tactic_file);
 
-    // Z3 prints `(goals (goal <lits…> :precision …))`. Extract the literals; if
-    // the output is empty or unexpected, fall back to the original file rather
-    // than emit an (unsound) empty-assertion goal.
+    // z3 prints `(goals (goal <lits…> :precision … :depth …))`. Take the literals
+    // up to the first `:keyword` (so bare `false`/`true` goals are preserved);
+    // fall back to the original file if the output is not a parseable goal.
     let forms = read_all(&output);
     let goal_lits: Option<Vec<Sexp>> = forms
         .first()
@@ -186,7 +209,7 @@ pub fn eliminate_eqs(path: &str) -> std::io::Result<std::path::PathBuf> {
         .map(|goal| {
             goal[1..]
                 .iter()
-                .filter(|x| matches!(x, Sexp::List(_)))
+                .take_while(|x| !matches!(x, Sexp::Sym(s) if s.starts_with(':')))
                 .cloned()
                 .collect()
         });
@@ -196,7 +219,7 @@ pub fn eliminate_eqs(path: &str) -> std::io::Result<std::path::PathBuf> {
         None => return Ok(std::path::PathBuf::from(path)),
     };
 
-    let out_path = temp_path("solveeqs-out");
+    let out_path = temp_path(&format!("{tag}-out"));
     {
         let mut f = std::fs::File::create(&out_path)?;
         for d in &decls {
@@ -208,4 +231,14 @@ pub fn eliminate_eqs(path: &str) -> std::io::Result<std::path::PathBuf> {
         writeln!(f, "(check-sat)")?;
     }
     Ok(out_path)
+}
+
+/// jfs-opt-equivalent simplification preprocessing (z3 only). See [`JFS_OPT_TACTIC`].
+pub fn simplify_jfs(path: &str) -> std::io::Result<std::path::PathBuf> {
+    apply_z3_tactic(path, JFS_OPT_TACTIC, "simplify")
+}
+
+/// `(eliminate-eqs file)` — run Z3's `solve-eqs` tactic.
+pub fn eliminate_eqs(path: &str) -> std::io::Result<std::path::PathBuf> {
+    apply_z3_tactic(path, "solve-eqs", "solveeqs")
 }

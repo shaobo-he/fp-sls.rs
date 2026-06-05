@@ -20,6 +20,7 @@ struct Options {
     try_real_models: bool,
     vns: bool,
     heuristics: bool,
+    simplify: bool,
     elim_eqs: bool,
     print_models: bool,
     debug: bool,
@@ -38,6 +39,7 @@ impl Default for Options {
             try_real_models: false,
             vns: false,
             heuristics: false,
+            simplify: true,
             elim_eqs: false,
             print_models: false,
             debug: false,
@@ -61,7 +63,8 @@ options:
   --try-real-models          seed search from a Z3 real-relaxation model
   --vns                      use variable-neighborhood search
   --heuristics               use the paper's heuristics (UCB + PAWS weights + restarts)
-  --elim-eqs                 preprocess with Z3's solve-eqs tactic
+  --no-simplify              skip the default z3 simplification (jfs-opt equivalent)
+  --elim-eqs                 also preprocess with Z3's solve-eqs tactic
   --print-models             print the model when sat
   --debug                    log per-step score to stderr
   --stats                    print `steps <n>` to stderr on a sat result
@@ -140,6 +143,8 @@ fn parse_args() -> Result<Options, String> {
             "--try-real-models" => opts.try_real_models = true,
             "--vns" => opts.vns = true,
             "--heuristics" => opts.heuristics = true,
+            "--no-simplify" => opts.simplify = false,
+            "--simplify" => opts.simplify = true,
             "--elim-eqs" => opts.elim_eqs = true,
             "--print-models" => opts.print_models = true,
             "--debug" => opts.debug = true,
@@ -176,18 +181,21 @@ fn main() {
         }
     };
 
-    // Optional Z3 solve-eqs preprocessing.
-    let (input_file, _tmp): (String, Option<std::path::PathBuf>) = if opts.elim_eqs {
-        match z3::eliminate_eqs(&file) {
-            Ok(p) => (p.to_string_lossy().into_owned(), Some(p)),
-            Err(e) => {
-                eprintln!("warning: --elim-eqs failed ({e}); using original file");
-                (file.clone(), None)
-            }
+    // Z3 preprocessing: jfs-opt-equivalent simplification (on by default), then
+    // optionally solve-eqs. Both fall back transparently if z3 is unavailable.
+    let mut input_file = file.clone();
+    if opts.simplify {
+        match z3::simplify_jfs(&input_file) {
+            Ok(p) => input_file = p.to_string_lossy().into_owned(),
+            Err(e) => eprintln!("warning: simplification failed ({e}); using raw input"),
         }
-    } else {
-        (file.clone(), None)
-    };
+    }
+    if opts.elim_eqs {
+        match z3::eliminate_eqs(&input_file) {
+            Ok(p) => input_file = p.to_string_lossy().into_owned(),
+            Err(e) => eprintln!("warning: --elim-eqs failed ({e}); skipping it"),
+        }
+    }
 
     let cmds = read_file(&input_file).unwrap_or_else(|e| {
         eprintln!("error: cannot read {input_file}: {e}");
