@@ -15,7 +15,7 @@ use crate::data::bitvec::BitVec;
 use crate::data::fp::{rounding_mode, FloatingPoint};
 use crate::data::value::{Assignment, Value};
 use crate::parsing::parse::Type;
-use crate::score::{score_atom, score_bool_value};
+use crate::score::{score_atom, score_atom_f64, score_bool_value, score_bool_value_f64};
 use crate::sexp::Sexp;
 use rug::float::Round;
 use rug::{Integer, Rational};
@@ -137,6 +137,7 @@ pub struct Dag {
 pub struct Scorer {
     val: Vec<Option<Value>>,
     scr: Vec<Option<Rational>>,
+    scr_f64: Vec<Option<f64>>,
 }
 
 /// `let` scope: term bindings map to a shared node id; boolean bindings are kept
@@ -557,6 +558,7 @@ impl Dag {
         Scorer {
             val: vec![None; self.nodes.len()],
             scr: vec![None; self.nodes.len()],
+            scr_f64: vec![None; self.nodes.len()],
         }
     }
 
@@ -569,6 +571,22 @@ impl Dag {
         self.roots
             .iter()
             .map(|&r| s.scr[r as usize].clone().expect("root scored"))
+            .collect()
+    }
+
+    /// Like [`eval_into`] but accumulates the boolean structure in `f64` instead
+    /// of exact `Rational` (the `∧`-mean / `∨`-max aggregation is where rational
+    /// denominators blow up). Atom scores are still computed exactly and then
+    /// converted, so only the *guidance* is approximate — the `== 1.0` it can
+    /// report is verified against the exact path before declaring sat.
+    pub fn eval_into_f64(&self, c: &Rational, asn: &Assignment, s: &mut Scorer) -> Vec<f64> {
+        let c64 = c.to_f64();
+        for id in 0..self.nodes.len() {
+            self.eval_node_f64(id, asn, c64, &mut s.val, &mut s.scr_f64);
+        }
+        self.roots
+            .iter()
+            .map(|&r| s.scr_f64[r as usize].expect("root scored"))
             .collect()
     }
 
@@ -657,6 +675,60 @@ impl Dag {
             }
             Node::BoolTerm(neg, t) => {
                 scr[id] = Some(score_bool_value(*neg, &v(val, *t)));
+            }
+        }
+    }
+
+    /// f64-scored mirror of [`eval_node`]: identical value computation, but the
+    /// boolean structure aggregates in `f64`. Atom/bool scores reuse the exact
+    /// `score_atom`/`score_bool_value` and convert once at the leaf.
+    fn eval_node_f64(
+        &self,
+        id: usize,
+        asn: &Assignment,
+        c: f64,
+        val: &mut [Option<Value>],
+        scr: &mut [Option<f64>],
+    ) {
+        let v = |val: &[Option<Value>], i: Id| val[i as usize].clone().expect("child value");
+        match &self.nodes[id] {
+            Node::Const(x) => val[id] = Some(x.clone()),
+            Node::Var(idx) => {
+                let name = &self.vars[*idx as usize];
+                val[id] = Some(asn.get(name).expect("var in assignment").clone());
+            }
+            Node::Term(op, ch) => {
+                let r = self.apply_op(*op, ch, val);
+                val[id] = Some(r);
+            }
+            Node::True => scr[id] = Some(1.0),
+            Node::False => scr[id] = Some(0.0),
+            Node::And(ch) => {
+                if ch.is_empty() {
+                    scr[id] = Some(1.0);
+                } else {
+                    let mut sum = 0.0f64;
+                    for &k in ch {
+                        sum += scr[k as usize].expect("and child");
+                    }
+                    scr[id] = Some(sum / ch.len() as f64);
+                }
+            }
+            Node::Or(ch) => {
+                let mut m = 0.0f64;
+                for &k in ch {
+                    let s = scr[k as usize].expect("or child");
+                    if s > m {
+                        m = s;
+                    }
+                }
+                scr[id] = Some(m);
+            }
+            Node::AtomNode(kind, neg, a, b) => {
+                scr[id] = Some(score_atom_f64(c, kind.head(), *neg, &v(val, *a), &v(val, *b)));
+            }
+            Node::BoolTerm(neg, t) => {
+                scr[id] = Some(score_bool_value_f64(*neg, &v(val, *t)));
             }
         }
     }

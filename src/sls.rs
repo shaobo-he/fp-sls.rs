@@ -53,6 +53,9 @@ pub struct Params {
     pub debug: bool,
     /// When set, print `steps <n>` to stderr on a `sat` result (`--stats`).
     pub stats: bool,
+    /// When set, guide the search with approximate `f64` scores instead of exact
+    /// `Rational` (sat is still confirmed exactly). `--f64-score`.
+    pub f64_score: bool,
 }
 
 // ---------- assignment construction ----------
@@ -163,6 +166,50 @@ fn eval_with_move(
     scores
 }
 
+// ---------- f64 (approximate) scoring variants (`--f64-score`) ----------
+
+fn average_f64(scores: &[f64]) -> f64 {
+    scores.iter().sum::<f64>() / scores.len() as f64
+}
+
+/// A satisfied atom scores *exactly* 1.0 (boolean early-return), an unsatisfied
+/// one ≤ c < 1; but deep `∧`-mean nesting can round a faint violation up to 1.0,
+/// so this is only a *trigger* for an exact re-check, never the sat decision.
+fn all_satisfied_f64(scores: &[f64]) -> bool {
+    scores.iter().all(|&s| s >= 1.0)
+}
+
+fn select_assertion_idx_f64(scores: &[f64]) -> usize {
+    let key = |s: f64| -> f64 { if s < 1.0 { s } else { -1.0 } };
+    let mut best = 0;
+    let mut best_key = key(scores[0]);
+    for i in 1..scores.len() {
+        let k = key(scores[i]);
+        if k > best_key {
+            best_key = k;
+            best = i;
+        }
+    }
+    best
+}
+
+fn eval_with_move_f64(
+    dag: &Dag,
+    c: &Rational,
+    asn: &mut Assignment,
+    sc: &mut Scorer,
+    var: &str,
+    nv: &Value,
+) -> Vec<f64> {
+    let old = std::mem::replace(
+        asn.get_mut(var).expect("candidate variable present in assignment"),
+        nv.clone(),
+    );
+    let scores = dag.eval_into_f64(c, asn, sc);
+    *asn.get_mut(var).expect("candidate variable present in assignment") = old;
+    scores
+}
+
 // ---------- WalkSAT-style SLS ----------
 
 pub fn sls(
@@ -258,6 +305,74 @@ pub fn sls_vns(
     let nc = 3u32;
     let mut ni = 1u32;
     for step in 0..params.max_steps {
+        if params.f64_score {
+            // ---- approximate f64-guided step (sat confirmed exactly) ----
+            let assert_scores = dag.eval_into_f64(&params.c2, &assignment, &mut sc);
+            if all_satisfied_f64(&assert_scores)
+                && all_satisfied(&dag.eval_into(&params.c2, &assignment, &mut sc))
+            {
+                if params.stats {
+                    eprintln!("steps {step}");
+                }
+                return SolveResult::Sat(dag.models(&assignment));
+            }
+            let curr_score = average_f64(&assert_scores);
+            if params.debug {
+                eprintln!("[vns] step {step} (ni={ni}): score {curr_score:.6}");
+            }
+            let cand_idx = select_assertion_idx_f64(&assert_scores);
+            let cand_vars = dag.assert_var_names(cand_idx);
+            let mut moves: Vec<(&str, Value)> = Vec::new();
+            for &var in &cand_vars {
+                let val = get_value(&assignment, var).clone();
+                for nv in vns_neighbor_values(&val, ni, rng) {
+                    moves.push((var, nv));
+                }
+            }
+            let improving: Option<usize> = if moves.is_empty() {
+                None
+            } else {
+                let mut best = 0;
+                let mut best_score = average_f64(&eval_with_move_f64(
+                    &dag, &params.c2, &mut assignment, &mut sc, moves[0].0, &moves[0].1,
+                ));
+                for i in 1..moves.len() {
+                    let s = average_f64(&eval_with_move_f64(
+                        &dag, &params.c2, &mut assignment, &mut sc, moves[i].0, &moves[i].1,
+                    ));
+                    if s > best_score {
+                        best_score = s;
+                        best = i;
+                    }
+                }
+                if best_score > curr_score {
+                    Some(best)
+                } else {
+                    None
+                }
+            };
+            match improving {
+                Some(i) => {
+                    let var = moves[i].0;
+                    let nv = moves[i].1.clone();
+                    *assignment
+                        .get_mut(var)
+                        .expect("candidate variable present in assignment") = nv;
+                    ni = 1;
+                }
+                None => {
+                    let new_ni = ni + 1;
+                    if new_ni > nc {
+                        assignment = randomize_assignment(var_info, rng);
+                        ni = 1;
+                    } else {
+                        ni = new_ni;
+                    }
+                }
+            }
+            continue;
+        }
+
         let assert_scores = dag.eval_into(&params.c2, &assignment, &mut sc);
         if all_satisfied(&assert_scores) {
             if params.stats {

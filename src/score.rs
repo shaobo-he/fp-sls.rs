@@ -402,3 +402,220 @@ fn score_negation(c: &R, asn: &Assignment, env: &[(String, Value)], inner: &Sexp
     // `(¬ b)` for a boolean atom `b`.
     score_bool_neg(&ev(inner, asn, env))
 }
+
+// ---------- f64 (approximate) scoring (`--f64-score`) ----------
+//
+// Exact mirror of the case analysis above, but the distance is computed in
+// `f64` so the hot loop avoids per-atom `Rational` construction. The boolean
+// "satisfied" early-returns are identical, so a satisfied atom still scores
+// exactly 1.0 (sat is still confirmed against the exact path).
+
+fn bv_dist_score_f64(c: f64, bv1: &BitVec, bv2: &BitVec, eq: bool) -> f64 {
+    let mut dist = Integer::from(&bv1.value - &bv2.value).abs();
+    if eq {
+        dist += 1;
+    }
+    c * (1.0 - dist.to_f64() / two_pow(bv1.width).to_f64())
+}
+
+fn fp_dist_score_f64(c: f64, fp1: &FloatingPoint, fp2: &FloatingPoint, eq: bool) -> f64 {
+    let mut dist = (get_fp_pos(fp1) - get_fp_pos(fp2)).abs();
+    if eq {
+        dist += 1;
+    }
+    let den = two_pow(fp1.exp_width + fp2.sig_width);
+    c * (1.0 - dist.to_f64() / den.to_f64())
+}
+
+fn score_bv_eq_f64(c: f64, bv1: &BitVec, bv2: &BitVec) -> f64 {
+    if bv1.bv_eq(bv2) {
+        1.0
+    } else {
+        c * (1.0 - bv1.hamming_distance(bv2) as f64 / bv1.width as f64)
+    }
+}
+fn score_bv_ne_f64(bv1: &BitVec, bv2: &BitVec) -> f64 {
+    if bv1.bv_eq(bv2) {
+        0.0
+    } else {
+        1.0
+    }
+}
+fn score_fp_eq_raw_f64(c: f64, fp1: &FloatingPoint, fp2: &FloatingPoint) -> f64 {
+    if fp1.is_nan() && fp2.is_nan() {
+        1.0
+    } else if fp1.is_nan() || fp2.is_nan() {
+        0.0
+    } else if fp1.to_bitvec().bv_eq(&fp2.to_bitvec()) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, fp1, fp2, false)
+    }
+}
+fn score_fp_ne_raw_f64(fp1: &FloatingPoint, fp2: &FloatingPoint) -> f64 {
+    if fp1.is_nan() && fp2.is_nan() {
+        0.0
+    } else if fp1.is_nan() || fp2.is_nan() {
+        1.0
+    } else {
+        score_bv_ne_f64(&fp1.to_bitvec(), &fp2.to_bitvec())
+    }
+}
+fn score_eq_f64(c: f64, v1: &Value, v2: &Value) -> f64 {
+    match (v1, v2) {
+        (Value::BV(a), Value::BV(b)) => score_bv_eq_f64(c, a, b),
+        (Value::FP(a), Value::FP(b)) => score_fp_eq_raw_f64(c, a, b),
+        _ => panic!("type mismatch in ="),
+    }
+}
+fn score_ne_f64(v1: &Value, v2: &Value) -> f64 {
+    match (v1, v2) {
+        (Value::BV(a), Value::BV(b)) => score_bv_ne_f64(a, b),
+        (Value::FP(a), Value::FP(b)) => score_fp_ne_raw_f64(a, b),
+        _ => panic!("type mismatch in ≠"),
+    }
+}
+fn score_fpeq_f64(c: f64, fp1: &FloatingPoint, fp2: &FloatingPoint) -> f64 {
+    if fp1.is_nan() || fp2.is_nan() {
+        0.0
+    } else if fp1.is_zero() && fp2.is_zero() {
+        1.0
+    } else {
+        score_fp_eq_raw_f64(c, fp1, fp2)
+    }
+}
+fn score_fp_not_eq_f64(fp1: &FloatingPoint, fp2: &FloatingPoint) -> f64 {
+    if fp1.is_nan() || fp2.is_nan() {
+        1.0
+    } else if fp1.is_zero() && fp2.is_zero() {
+        0.0
+    } else {
+        score_bv_ne_f64(&fp1.to_bitvec(), &fp2.to_bitvec())
+    }
+}
+fn score_bv_lt_f64(c: f64, bv1: &BitVec, bv2: &BitVec) -> f64 {
+    if bv1.bv_lt(bv2) {
+        1.0
+    } else {
+        bv_dist_score_f64(c, bv1, bv2, true)
+    }
+}
+fn score_bv_ge_f64(c: f64, bv1: &BitVec, bv2: &BitVec) -> f64 {
+    if bv1.bv_ge(bv2) {
+        1.0
+    } else {
+        bv_dist_score_f64(c, bv1, bv2, false)
+    }
+}
+fn score_fplt_f64(c: f64, a: &FloatingPoint, b: &FloatingPoint) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        0.0
+    } else if a.fp_lt(b) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, a, b, true)
+    }
+}
+fn score_fp_not_lt_f64(c: f64, a: &FloatingPoint, b: &FloatingPoint) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        1.0
+    } else if a.fp_ge(b) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, a, b, false)
+    }
+}
+fn score_fpleq_f64(c: f64, a: &FloatingPoint, b: &FloatingPoint) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        0.0
+    } else if a.fp_le(b) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, a, b, false)
+    }
+}
+fn score_fp_not_leq_f64(c: f64, a: &FloatingPoint, b: &FloatingPoint) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        1.0
+    } else if a.fp_gt(b) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, a, b, true)
+    }
+}
+fn score_fpgt_f64(c: f64, a: &FloatingPoint, b: &FloatingPoint) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        0.0
+    } else if a.fp_gt(b) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, a, b, true)
+    }
+}
+fn score_fp_not_gt_f64(c: f64, a: &FloatingPoint, b: &FloatingPoint) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        1.0
+    } else if a.fp_le(b) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, a, b, false)
+    }
+}
+fn score_fpgeq_f64(c: f64, a: &FloatingPoint, b: &FloatingPoint) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        0.0
+    } else if a.fp_ge(b) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, a, b, false)
+    }
+}
+fn score_fp_not_geq_f64(c: f64, a: &FloatingPoint, b: &FloatingPoint) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        1.0
+    } else if a.fp_lt(b) {
+        1.0
+    } else {
+        fp_dist_score_f64(c, a, b, true)
+    }
+}
+fn score_bool_f64(v: &Value) -> f64 {
+    v.as_bv().eval_id().to_f64()
+}
+
+/// f64 mirror of [`score_atom`].
+pub(crate) fn score_atom_f64(c: f64, head: &str, neg: bool, v1: &Value, v2: &Value) -> f64 {
+    if !neg {
+        match head {
+            "=" => score_eq_f64(c, v1, v2),
+            "bvult" => score_bv_lt_f64(c, v1.as_bv(), v2.as_bv()),
+            "fp.lt" => score_fplt_f64(c, v1.as_fp(), v2.as_fp()),
+            "fp.leq" => score_fpleq_f64(c, v1.as_fp(), v2.as_fp()),
+            "fp.gt" => score_fpgt_f64(c, v1.as_fp(), v2.as_fp()),
+            "fp.geq" => score_fpgeq_f64(c, v1.as_fp(), v2.as_fp()),
+            "fp.eq" => score_fpeq_f64(c, v1.as_fp(), v2.as_fp()),
+            _ => panic!("not a scorable atom: {head}"),
+        }
+    } else {
+        match head {
+            "=" => score_ne_f64(v1, v2),
+            "bvult" => score_bv_ge_f64(c, v1.as_bv(), v2.as_bv()),
+            "fp.lt" => score_fp_not_lt_f64(c, v1.as_fp(), v2.as_fp()),
+            "fp.leq" => score_fp_not_leq_f64(c, v1.as_fp(), v2.as_fp()),
+            "fp.gt" => score_fp_not_gt_f64(c, v1.as_fp(), v2.as_fp()),
+            "fp.geq" => score_fp_not_geq_f64(c, v1.as_fp(), v2.as_fp()),
+            "fp.eq" => score_fp_not_eq_f64(v1.as_fp(), v2.as_fp()),
+            _ => panic!("not a scorable atom: {head}"),
+        }
+    }
+}
+
+/// f64 mirror of [`score_bool_value`].
+pub(crate) fn score_bool_value_f64(neg: bool, v: &Value) -> f64 {
+    let b = score_bool_f64(v);
+    if neg {
+        1.0 - b
+    } else {
+        b
+    }
+}
