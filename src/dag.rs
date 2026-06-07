@@ -15,7 +15,7 @@ use crate::data::bitvec::BitVec;
 use crate::data::fp::{rounding_mode, FloatingPoint};
 use crate::data::value::{Assignment, Value};
 use crate::parsing::parse::Type;
-use crate::score::{score_atom, score_bool_value};
+use crate::score::{score_atom, score_bool_value, ScoreNum};
 use crate::sexp::Sexp;
 use rug::float::Round;
 use rug::{Integer, Rational};
@@ -137,6 +137,7 @@ pub struct Dag {
 pub struct Scorer {
     val: Vec<Option<Value>>,
     scr: Vec<Option<Rational>>,
+    scr_f64: Vec<Option<f64>>,
 }
 
 /// `let` scope: term bindings map to a shared node id; boolean bindings are kept
@@ -557,6 +558,7 @@ impl Dag {
         Scorer {
             val: vec![None; self.nodes.len()],
             scr: vec![None; self.nodes.len()],
+            scr_f64: vec![None; self.nodes.len()],
         }
     }
 
@@ -569,6 +571,22 @@ impl Dag {
         self.roots
             .iter()
             .map(|&r| s.scr[r as usize].clone().expect("root scored"))
+            .collect()
+    }
+
+    /// Like [`eval_into`] but accumulates the boolean structure in `f64` instead
+    /// of exact `Rational` (the `∧`-mean / `∨`-max aggregation is where rational
+    /// denominators blow up). Atom scores are still computed exactly and then
+    /// converted, so only the *guidance* is approximate — the `== 1.0` it can
+    /// report is verified against the exact path before declaring sat.
+    pub fn eval_into_f64(&self, c: &Rational, asn: &Assignment, s: &mut Scorer) -> Vec<f64> {
+        let c64 = c.to_f64();
+        for id in 0..self.nodes.len() {
+            self.eval_node(id, asn, &c64, &mut s.val, &mut s.scr_f64);
+        }
+        self.roots
+            .iter()
+            .map(|&r| s.scr_f64[r as usize].expect("root scored"))
             .collect()
     }
 
@@ -610,13 +628,16 @@ impl Dag {
     }
 
     /// Evaluate node `id`, assuming all children (lower ids) are already done.
-    fn eval_node(
+    /// Generic over the score type `S` ([`Rational`] for the exact path, `f64`
+    /// for `--f64-score`): the *value* computation is identical and exact; only
+    /// the boolean-structure aggregation (`∧`-mean / `∨`-max) runs in `S`.
+    fn eval_node<S: ScoreNum>(
         &self,
         id: usize,
         asn: &Assignment,
-        c: &Rational,
+        c: &S,
         val: &mut [Option<Value>],
-        scr: &mut [Option<Rational>],
+        scr: &mut [Option<S>],
     ) {
         let v = |val: &[Option<Value>], i: Id| val[i as usize].clone().expect("child value");
         match &self.nodes[id] {
@@ -629,25 +650,25 @@ impl Dag {
                 let r = self.apply_op(*op, ch, val);
                 val[id] = Some(r);
             }
-            Node::True => scr[id] = Some(Rational::from(1)),
-            Node::False => scr[id] = Some(Rational::from(0)),
+            Node::True => scr[id] = Some(S::one()),
+            Node::False => scr[id] = Some(S::zero()),
             Node::And(ch) => {
                 if ch.is_empty() {
-                    scr[id] = Some(Rational::from(1));
+                    scr[id] = Some(S::one());
                 } else {
-                    let mut sum = Rational::from(0);
+                    let mut sum = S::zero();
                     for &k in ch {
-                        sum += scr[k as usize].as_ref().expect("and child");
+                        sum = sum + scr[k as usize].clone().expect("and child");
                     }
-                    scr[id] = Some(sum / Rational::from(ch.len() as u32));
+                    scr[id] = Some(sum / S::from_count(ch.len()));
                 }
             }
             Node::Or(ch) => {
-                let mut m = Rational::from(0);
+                let mut m = S::zero();
                 for &k in ch {
-                    let s = scr[k as usize].as_ref().expect("or child");
-                    if *s > m {
-                        m = s.clone();
+                    let s = scr[k as usize].clone().expect("or child");
+                    if s > m {
+                        m = s;
                     }
                 }
                 scr[id] = Some(m);

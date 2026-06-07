@@ -5,14 +5,19 @@
 //! average and disjunctions take the maximum; (in)equalities degrade smoothly
 //! with a distance metric scaled by the constant `c`.
 //!
-//! All scores are exact rationals (`rug::Rational`) — this realizes the Racket
-//! TODO "add types to score functions (they should be rational rather than
-//! floating point)".
+//! The scoring logic is written **once**, generic over [`ScoreNum`], and
+//! instantiated at exact `Rational` (the sound default) and approximate `f64`
+//! (`--f64-score`). The only precision-specific operation is
+//! [`ScoreNum::from_ratio`], which turns an exactly-computed integer distance
+//! `num/den` into a score; everything else (the NaN/zero case analysis, the
+//! `1 - dist`, the `c·…` scaling, max and mean aggregation) is shared. Rust
+//! monomorphizes generics, so each instantiation is as fast as a hand-written
+//! version.
 //!
 //! Two fixes relative to the Racket original:
 //!   * positive `fp.gt` now threads `env` (the Racket `score` clause dropped it,
 //!     an arity bug that crashed on any un-negated `fp.gt`);
-//!   * scores are exact rationals rather than inexact flonums.
+//!   * scores are exact rationals (or, opt-in, `f64`) rather than inexact flonums.
 
 // The FP predicate scores below deliberately keep each paper case clause
 // separate even when two clauses return the same constant (e.g. NaN ⇒ 1 and
@@ -25,16 +30,64 @@ use crate::data::fp::FloatingPoint;
 use crate::data::value::{Assignment, Value};
 use crate::sexp::Sexp;
 use rug::{Integer, Rational};
+use std::ops::{Add, Div, Sub};
 
-type R = Rational;
+// ---------- the score numeric type ----------
 
-fn one() -> R {
-    R::from(1)
+/// The numeric type used to *rank* candidate moves. Implemented for exact
+/// `Rational` (sound default) and approximate `f64` (`--f64-score`). The exact
+/// distance is always computed in `Integer`; only [`from_ratio`](ScoreNum::from_ratio)
+/// is precision-specific.
+pub trait ScoreNum:
+    Clone + PartialOrd + Add<Output = Self> + Sub<Output = Self> + Div<Output = Self>
+{
+    fn one() -> Self;
+    fn zero() -> Self;
+    /// The exactly-computed distance ratio `num/den`, as a score.
+    fn from_ratio(num: Integer, den: Integer) -> Self;
+    /// A conjunct count `n`, as a `∧`-mean denominator.
+    fn from_count(n: usize) -> Self;
+    /// `self · x` — scale a `[0,1]` score by the constant `c`.
+    fn scale(&self, x: Self) -> Self;
 }
-fn zero() -> R {
-    R::from(0)
+
+impl ScoreNum for Rational {
+    fn one() -> Self {
+        Rational::from(1)
+    }
+    fn zero() -> Self {
+        Rational::from(0)
+    }
+    fn from_ratio(num: Integer, den: Integer) -> Self {
+        Rational::from((num, den))
+    }
+    fn from_count(n: usize) -> Self {
+        Rational::from(n as u32)
+    }
+    fn scale(&self, x: Self) -> Self {
+        self * x
+    }
 }
-fn rmax(a: R, b: R) -> R {
+
+impl ScoreNum for f64 {
+    fn one() -> Self {
+        1.0
+    }
+    fn zero() -> Self {
+        0.0
+    }
+    fn from_ratio(num: Integer, den: Integer) -> Self {
+        num.to_f64() / den.to_f64()
+    }
+    fn from_count(n: usize) -> Self {
+        n as f64
+    }
+    fn scale(&self, x: Self) -> Self {
+        self * x
+    }
+}
+
+fn smax<S: PartialOrd>(a: S, b: S) -> S {
     if a >= b {
         a
     } else {
@@ -45,29 +98,29 @@ fn rmax(a: R, b: R) -> R {
 // ---------- distance-based scores ----------
 
 /// `c · (1 - dist/2^width)`, with `dist = |v1 - v2| + [eq]`.
-fn bv_dist_score(c: &R, bv1: &BitVec, bv2: &BitVec, eq: bool) -> R {
+fn bv_dist_score<S: ScoreNum>(c: &S, bv1: &BitVec, bv2: &BitVec, eq: bool) -> S {
     let mut dist = Integer::from(&bv1.value - &bv2.value).abs();
     if eq {
         dist += 1;
     }
-    c * (one() - R::from((dist, two_pow(bv1.width))))
+    c.scale(S::one() - S::from_ratio(dist, two_pow(bv1.width)))
 }
 
 /// `(Hamming-distance …)`-based equality score for bit-vectors.
-fn score_bv_eq(c: &R, bv1: &BitVec, bv2: &BitVec) -> R {
+fn score_bv_eq<S: ScoreNum>(c: &S, bv1: &BitVec, bv2: &BitVec) -> S {
     if bv1.bv_eq(bv2) {
-        one()
+        S::one()
     } else {
         let h = bv1.hamming_distance(bv2);
-        c * (one() - R::from((Integer::from(h), Integer::from(bv1.width))))
+        c.scale(S::one() - S::from_ratio(Integer::from(h), Integer::from(bv1.width)))
     }
 }
 
-fn score_bv_ne(bv1: &BitVec, bv2: &BitVec) -> R {
+fn score_bv_ne<S: ScoreNum>(bv1: &BitVec, bv2: &BitVec) -> S {
     if bv1.bv_eq(bv2) {
-        zero()
+        S::zero()
     } else {
-        one()
+        S::one()
     }
 }
 
@@ -82,40 +135,40 @@ fn get_fp_pos(fp: &FloatingPoint) -> Integer {
     }
 }
 
-fn fp_dist_score(c: &R, fp1: &FloatingPoint, fp2: &FloatingPoint, eq: bool) -> R {
+fn fp_dist_score<S: ScoreNum>(c: &S, fp1: &FloatingPoint, fp2: &FloatingPoint, eq: bool) -> S {
     let mut dist = (get_fp_pos(fp1) - get_fp_pos(fp2)).abs();
     if eq {
         dist += 1;
     }
     let den = two_pow(fp1.exp_width + fp2.sig_width);
-    c * (one() - R::from((dist, den)))
+    c.scale(S::one() - S::from_ratio(dist, den))
 }
 
 // ---------- equality / inequality ----------
 
-fn score_fp_eq_raw(c: &R, fp1: &FloatingPoint, fp2: &FloatingPoint) -> R {
+fn score_fp_eq_raw<S: ScoreNum>(c: &S, fp1: &FloatingPoint, fp2: &FloatingPoint) -> S {
     if fp1.is_nan() && fp2.is_nan() {
-        one()
+        S::one()
     } else if fp1.is_nan() || fp2.is_nan() {
-        zero()
+        S::zero()
     } else if fp1.to_bitvec().bv_eq(&fp2.to_bitvec()) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, fp1, fp2, false)
     }
 }
 
-fn score_fp_ne_raw(fp1: &FloatingPoint, fp2: &FloatingPoint) -> R {
+fn score_fp_ne_raw<S: ScoreNum>(fp1: &FloatingPoint, fp2: &FloatingPoint) -> S {
     if fp1.is_nan() && fp2.is_nan() {
-        zero()
+        S::zero()
     } else if fp1.is_nan() || fp2.is_nan() {
-        one()
+        S::one()
     } else {
         score_bv_ne(&fp1.to_bitvec(), &fp2.to_bitvec())
     }
 }
 
-fn score_eq(c: &R, v1: &Value, v2: &Value) -> R {
+fn score_eq<S: ScoreNum>(c: &S, v1: &Value, v2: &Value) -> S {
     match (v1, v2) {
         (Value::BV(a), Value::BV(b)) => score_bv_eq(c, a, b),
         (Value::FP(a), Value::FP(b)) => score_fp_eq_raw(c, a, b),
@@ -123,7 +176,7 @@ fn score_eq(c: &R, v1: &Value, v2: &Value) -> R {
     }
 }
 
-fn score_ne(v1: &Value, v2: &Value) -> R {
+fn score_ne<S: ScoreNum>(v1: &Value, v2: &Value) -> S {
     match (v1, v2) {
         (Value::BV(a), Value::BV(b)) => score_bv_ne(a, b),
         (Value::FP(a), Value::FP(b)) => score_fp_ne_raw(a, b),
@@ -132,21 +185,21 @@ fn score_ne(v1: &Value, v2: &Value) -> R {
 }
 
 // `fp.eq` / `¬fp.eq`: IEEE equality, which makes ±0 equal and any-NaN unequal.
-fn score_fpeq(c: &R, fp1: &FloatingPoint, fp2: &FloatingPoint) -> R {
+fn score_fpeq<S: ScoreNum>(c: &S, fp1: &FloatingPoint, fp2: &FloatingPoint) -> S {
     if fp1.is_nan() || fp2.is_nan() {
-        zero()
+        S::zero()
     } else if fp1.is_zero() && fp2.is_zero() {
-        one()
+        S::one()
     } else {
         score_fp_eq_raw(c, fp1, fp2)
     }
 }
 
-fn score_fp_not_eq(fp1: &FloatingPoint, fp2: &FloatingPoint) -> R {
+fn score_fp_not_eq<S: ScoreNum>(fp1: &FloatingPoint, fp2: &FloatingPoint) -> S {
     if fp1.is_nan() || fp2.is_nan() {
-        one()
+        S::one()
     } else if fp1.is_zero() && fp2.is_zero() {
-        zero()
+        S::zero()
     } else {
         score_bv_ne(&fp1.to_bitvec(), &fp2.to_bitvec())
     }
@@ -154,17 +207,17 @@ fn score_fp_not_eq(fp1: &FloatingPoint, fp2: &FloatingPoint) -> R {
 
 // ---------- bit-vector ordering ----------
 
-fn score_bv_lt(c: &R, bv1: &BitVec, bv2: &BitVec) -> R {
+fn score_bv_lt<S: ScoreNum>(c: &S, bv1: &BitVec, bv2: &BitVec) -> S {
     if bv1.bv_lt(bv2) {
-        one()
+        S::one()
     } else {
         bv_dist_score(c, bv1, bv2, true)
     }
 }
 
-fn score_bv_ge(c: &R, bv1: &BitVec, bv2: &BitVec) -> R {
+fn score_bv_ge<S: ScoreNum>(c: &S, bv1: &BitVec, bv2: &BitVec) -> S {
     if bv1.bv_ge(bv2) {
-        one()
+        S::one()
     } else {
         bv_dist_score(c, bv1, bv2, false)
     }
@@ -174,74 +227,74 @@ fn score_bv_ge(c: &R, bv1: &BitVec, bv2: &BitVec) -> R {
 // Each predicate has a score and a score for its negation; NaN makes the
 // predicate fail (score 0) and its negation hold (score 1).
 
-fn score_fplt(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
+fn score_fplt<S: ScoreNum>(c: &S, a: &FloatingPoint, b: &FloatingPoint) -> S {
     if a.is_nan() || b.is_nan() {
-        zero()
+        S::zero()
     } else if a.fp_lt(b) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, a, b, true)
     }
 }
-fn score_fp_not_lt(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
+fn score_fp_not_lt<S: ScoreNum>(c: &S, a: &FloatingPoint, b: &FloatingPoint) -> S {
     if a.is_nan() || b.is_nan() {
-        one()
+        S::one()
     } else if a.fp_ge(b) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, a, b, false)
     }
 }
-fn score_fpleq(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
+fn score_fpleq<S: ScoreNum>(c: &S, a: &FloatingPoint, b: &FloatingPoint) -> S {
     if a.is_nan() || b.is_nan() {
-        zero()
+        S::zero()
     } else if a.fp_le(b) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, a, b, false)
     }
 }
-fn score_fp_not_leq(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
+fn score_fp_not_leq<S: ScoreNum>(c: &S, a: &FloatingPoint, b: &FloatingPoint) -> S {
     if a.is_nan() || b.is_nan() {
-        one()
+        S::one()
     } else if a.fp_gt(b) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, a, b, true)
     }
 }
-fn score_fpgt(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
+fn score_fpgt<S: ScoreNum>(c: &S, a: &FloatingPoint, b: &FloatingPoint) -> S {
     if a.is_nan() || b.is_nan() {
-        zero()
+        S::zero()
     } else if a.fp_gt(b) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, a, b, true)
     }
 }
-fn score_fp_not_gt(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
+fn score_fp_not_gt<S: ScoreNum>(c: &S, a: &FloatingPoint, b: &FloatingPoint) -> S {
     if a.is_nan() || b.is_nan() {
-        one()
+        S::one()
     } else if a.fp_le(b) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, a, b, false)
     }
 }
-fn score_fpgeq(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
+fn score_fpgeq<S: ScoreNum>(c: &S, a: &FloatingPoint, b: &FloatingPoint) -> S {
     if a.is_nan() || b.is_nan() {
-        zero()
+        S::zero()
     } else if a.fp_ge(b) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, a, b, false)
     }
 }
-fn score_fp_not_geq(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
+fn score_fp_not_geq<S: ScoreNum>(c: &S, a: &FloatingPoint, b: &FloatingPoint) -> S {
     if a.is_nan() || b.is_nan() {
-        one()
+        S::one()
     } else if a.fp_lt(b) {
-        one()
+        S::one()
     } else {
         fp_dist_score(c, a, b, true)
     }
@@ -249,12 +302,12 @@ fn score_fp_not_geq(c: &R, a: &FloatingPoint, b: &FloatingPoint) -> R {
 
 // ---------- booleans ----------
 
-/// `(eval/id v)` as a rational (a boolean is a width-1 bit-vector).
-fn score_bool(v: &Value) -> R {
-    R::from(v.as_bv().eval_id().clone())
+/// `(eval/id v)` as a score (a boolean is a width-1 bit-vector, value 0 or 1).
+fn score_bool<S: ScoreNum>(v: &Value) -> S {
+    S::from_ratio(v.as_bv().eval_id().clone(), Integer::from(1))
 }
-fn score_bool_neg(v: &Value) -> R {
-    one() - score_bool(v)
+fn score_bool_neg<S: ScoreNum>(v: &Value) -> S {
+    S::one() - score_bool(v)
 }
 
 // ---------- the recursive scorer ----------
@@ -264,10 +317,10 @@ fn ev(t: &Sexp, asn: &Assignment, env: &[(String, Value)]) -> Value {
 }
 
 /// `((score c assignment env) formula)`.
-pub fn score(c: &R, asn: &Assignment, env: &[(String, Value)], formula: &Sexp) -> R {
+pub fn score<S: ScoreNum>(c: &S, asn: &Assignment, env: &[(String, Value)], formula: &Sexp) -> S {
     match formula {
-        Sexp::Sym(s) if s == "⊤" => return one(),
-        Sexp::Sym(s) if s == "⊥" => return zero(),
+        Sexp::Sym(s) if s == "⊤" => return S::one(),
+        Sexp::Sym(s) if s == "⊥" => return S::zero(),
         _ => {}
     }
 
@@ -290,22 +343,22 @@ pub fn score(c: &R, asn: &Assignment, env: &[(String, Value)], formula: &Sexp) -
             score(c, asn, &new_env, &items[2])
         }
         Some("∨") => {
-            let mut m = zero();
+            let mut m = S::zero();
             for arg in &items[1..] {
-                m = rmax(m, score(c, asn, env, arg));
+                m = smax(m, score(c, asn, env, arg));
             }
             m
         }
         Some("∧") => {
             let args = &items[1..];
             if args.is_empty() {
-                return one();
+                return S::one();
             }
-            let mut sum = zero();
+            let mut sum = S::zero();
             for arg in args {
-                sum += score(c, asn, env, arg);
+                sum = sum + score(c, asn, env, arg);
             }
-            sum / R::from(args.len() as u32)
+            sum / S::from_count(args.len())
         }
         Some("¬") => score_negation(c, asn, env, &items[1]),
         Some("=") => score_eq(c, &ev(&items[1], asn, env), &ev(&items[2], asn, env)),
@@ -349,7 +402,7 @@ pub fn score(c: &R, asn: &Assignment, env: &[(String, Value)], formula: &Sexp) -
 /// operand *values*. Used by the DAG scorer so it reuses the exact same case
 /// analysis as the recursive `score` above. `head` is the atom's operator
 /// symbol (`=`, `bvult`, `fp.lt`, …).
-pub(crate) fn score_atom(c: &R, head: &str, neg: bool, v1: &Value, v2: &Value) -> R {
+pub(crate) fn score_atom<S: ScoreNum>(c: &S, head: &str, neg: bool, v1: &Value, v2: &Value) -> S {
     if !neg {
         match head {
             "=" => score_eq(c, v1, v2),
@@ -376,7 +429,7 @@ pub(crate) fn score_atom(c: &R, head: &str, neg: bool, v1: &Value, v2: &Value) -
 }
 
 /// Score a bare boolean term value (a width-1 bit-vector), negated or not.
-pub(crate) fn score_bool_value(neg: bool, v: &Value) -> R {
+pub(crate) fn score_bool_value<S: ScoreNum>(neg: bool, v: &Value) -> S {
     if neg {
         score_bool_neg(v)
     } else {
@@ -384,7 +437,12 @@ pub(crate) fn score_bool_value(neg: bool, v: &Value) -> R {
     }
 }
 
-fn score_negation(c: &R, asn: &Assignment, env: &[(String, Value)], inner: &Sexp) -> R {
+fn score_negation<S: ScoreNum>(
+    c: &S,
+    asn: &Assignment,
+    env: &[(String, Value)],
+    inner: &Sexp,
+) -> S {
     if let Sexp::List(items) = inner {
         let a = || ev(&items[1], asn, env);
         let b = || ev(&items[2], asn, env);

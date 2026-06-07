@@ -121,7 +121,13 @@ type HashMapRat = std::collections::HashMap<String, Rational>;
 /// `(get-real-model file)` — solve the real relaxation and parse Z3's model.
 pub fn get_real_model(cmds: &[Sexp], var_info: &VarInfo) -> Option<Assignment> {
     // Build the real relaxation and ask for a model.
-    let path = temp_path("real");
+    // `FP_SLS_DUMP_REAL=<path>` dumps the NRA script there (and keeps it) for
+    // inspection / external solver comparison.
+    let dump = std::env::var("FP_SLS_DUMP_REAL").ok();
+    let path = match dump.as_deref() {
+        Some(p) => std::path::PathBuf::from(p),
+        None => temp_path("real"),
+    };
     {
         let mut f = std::fs::File::create(&path).ok()?;
         for cmd in cmds {
@@ -130,8 +136,20 @@ pub fn get_real_model(cmds: &[Sexp], var_info: &VarInfo) -> Option<Assignment> {
         }
         writeln!(f, "(get-model)").ok()?;
     }
+    let t0 = std::time::Instant::now();
     let output = run_z3(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
+    if let Some(p) = &dump {
+        let head = read_all(&output)
+            .first()
+            .map(|f| format!("{f}"))
+            .unwrap_or_else(|| "<no output>".into());
+        eprintln!(
+            "[real-model] z3 {:.1}s -> {head}  (dumped {p})",
+            t0.elapsed().as_secs_f64()
+        );
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
 
     let forms = read_all(&output);
     if forms.first().map(|f| f.is_sym("sat")) != Some(true) {

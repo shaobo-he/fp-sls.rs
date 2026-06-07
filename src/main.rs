@@ -29,6 +29,7 @@ struct Options {
     simplify: bool,
     elim_eqs: bool,
     print_models: bool,
+    f64_score: bool,
     debug: bool,
     stats: bool,
     file: Option<String>,
@@ -48,6 +49,7 @@ impl Default for Options {
             simplify: true,
             elim_eqs: false,
             print_models: false,
+            f64_score: false,
             debug: false,
             stats: false,
             file: None,
@@ -153,6 +155,7 @@ fn parse_args() -> Result<Options, String> {
             "--simplify" => opts.simplify = true,
             "--elim-eqs" => opts.elim_eqs = true,
             "--print-models" => opts.print_models = true,
+            "--f64-score" => opts.f64_score = true,
             "--debug" => opts.debug = true,
             "--stats" => opts.stats = true,
             other if other.starts_with('-') => {
@@ -282,6 +285,7 @@ fn solve(
         wp: opts.wp,
         debug: opts.debug,
         stats: opts.stats,
+        f64_score: opts.f64_score,
     };
 
     // Run the chosen strategy on a (possibly mode-substituted) formula.
