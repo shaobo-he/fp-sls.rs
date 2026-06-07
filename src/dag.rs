@@ -15,7 +15,7 @@ use crate::data::bitvec::BitVec;
 use crate::data::fp::{rounding_mode, FloatingPoint};
 use crate::data::value::{Assignment, Value};
 use crate::parsing::parse::Type;
-use crate::score::{score_atom, score_atom_f64, score_bool_value, score_bool_value_f64};
+use crate::score::{score_atom, score_bool_value, ScoreNum};
 use crate::sexp::Sexp;
 use rug::float::Round;
 use rug::{Integer, Rational};
@@ -582,7 +582,7 @@ impl Dag {
     pub fn eval_into_f64(&self, c: &Rational, asn: &Assignment, s: &mut Scorer) -> Vec<f64> {
         let c64 = c.to_f64();
         for id in 0..self.nodes.len() {
-            self.eval_node_f64(id, asn, c64, &mut s.val, &mut s.scr_f64);
+            self.eval_node(id, asn, &c64, &mut s.val, &mut s.scr_f64);
         }
         self.roots
             .iter()
@@ -628,13 +628,16 @@ impl Dag {
     }
 
     /// Evaluate node `id`, assuming all children (lower ids) are already done.
-    fn eval_node(
+    /// Generic over the score type `S` ([`Rational`] for the exact path, `f64`
+    /// for `--f64-score`): the *value* computation is identical and exact; only
+    /// the boolean-structure aggregation (`∧`-mean / `∨`-max) runs in `S`.
+    fn eval_node<S: ScoreNum>(
         &self,
         id: usize,
         asn: &Assignment,
-        c: &Rational,
+        c: &S,
         val: &mut [Option<Value>],
-        scr: &mut [Option<Rational>],
+        scr: &mut [Option<S>],
     ) {
         let v = |val: &[Option<Value>], i: Id| val[i as usize].clone().expect("child value");
         match &self.nodes[id] {
@@ -647,25 +650,25 @@ impl Dag {
                 let r = self.apply_op(*op, ch, val);
                 val[id] = Some(r);
             }
-            Node::True => scr[id] = Some(Rational::from(1)),
-            Node::False => scr[id] = Some(Rational::from(0)),
+            Node::True => scr[id] = Some(S::one()),
+            Node::False => scr[id] = Some(S::zero()),
             Node::And(ch) => {
                 if ch.is_empty() {
-                    scr[id] = Some(Rational::from(1));
+                    scr[id] = Some(S::one());
                 } else {
-                    let mut sum = Rational::from(0);
+                    let mut sum = S::zero();
                     for &k in ch {
-                        sum += scr[k as usize].as_ref().expect("and child");
+                        sum = sum + scr[k as usize].clone().expect("and child");
                     }
-                    scr[id] = Some(sum / Rational::from(ch.len() as u32));
+                    scr[id] = Some(sum / S::from_count(ch.len()));
                 }
             }
             Node::Or(ch) => {
-                let mut m = Rational::from(0);
+                let mut m = S::zero();
                 for &k in ch {
-                    let s = scr[k as usize].as_ref().expect("or child");
-                    if *s > m {
-                        m = s.clone();
+                    let s = scr[k as usize].clone().expect("or child");
+                    if s > m {
+                        m = s;
                     }
                 }
                 scr[id] = Some(m);
@@ -675,60 +678,6 @@ impl Dag {
             }
             Node::BoolTerm(neg, t) => {
                 scr[id] = Some(score_bool_value(*neg, &v(val, *t)));
-            }
-        }
-    }
-
-    /// f64-scored mirror of [`eval_node`]: identical value computation, but the
-    /// boolean structure aggregates in `f64`. Atom/bool scores reuse the exact
-    /// `score_atom`/`score_bool_value` and convert once at the leaf.
-    fn eval_node_f64(
-        &self,
-        id: usize,
-        asn: &Assignment,
-        c: f64,
-        val: &mut [Option<Value>],
-        scr: &mut [Option<f64>],
-    ) {
-        let v = |val: &[Option<Value>], i: Id| val[i as usize].clone().expect("child value");
-        match &self.nodes[id] {
-            Node::Const(x) => val[id] = Some(x.clone()),
-            Node::Var(idx) => {
-                let name = &self.vars[*idx as usize];
-                val[id] = Some(asn.get(name).expect("var in assignment").clone());
-            }
-            Node::Term(op, ch) => {
-                let r = self.apply_op(*op, ch, val);
-                val[id] = Some(r);
-            }
-            Node::True => scr[id] = Some(1.0),
-            Node::False => scr[id] = Some(0.0),
-            Node::And(ch) => {
-                if ch.is_empty() {
-                    scr[id] = Some(1.0);
-                } else {
-                    let mut sum = 0.0f64;
-                    for &k in ch {
-                        sum += scr[k as usize].expect("and child");
-                    }
-                    scr[id] = Some(sum / ch.len() as f64);
-                }
-            }
-            Node::Or(ch) => {
-                let mut m = 0.0f64;
-                for &k in ch {
-                    let s = scr[k as usize].expect("or child");
-                    if s > m {
-                        m = s;
-                    }
-                }
-                scr[id] = Some(m);
-            }
-            Node::AtomNode(kind, neg, a, b) => {
-                scr[id] = Some(score_atom_f64(c, kind.head(), *neg, &v(val, *a), &v(val, *b)));
-            }
-            Node::BoolTerm(neg, t) => {
-                scr[id] = Some(score_bool_value_f64(*neg, &v(val, *t)));
             }
         }
     }

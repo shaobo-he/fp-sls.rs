@@ -25,6 +25,7 @@ use crate::data::value::{Assignment, Value};
 use crate::dag::{Dag, Scorer};
 use crate::parsing::parse::{bool_type, bv_type, bv_type_width, fp_type, fp_type_widths, Type};
 use crate::rng::Rng;
+use crate::score::ScoreNum;
 use crate::sexp::Sexp;
 use rug::Rational;
 use std::collections::HashMap;
@@ -108,30 +109,30 @@ pub fn randomize_assignment(var_info: &VarInfo, rng: &mut Rng) -> Assignment {
 
 // ---------- shared helpers ----------
 
-fn one() -> Rational {
-    Rational::from(1)
-}
-
-fn average(scores: &[Rational]) -> Rational {
-    let mut sum = Rational::from(0);
+fn average<S: ScoreNum>(scores: &[S]) -> S {
+    let mut sum = S::zero();
     for s in scores {
-        sum += s;
+        sum = sum + s.clone();
     }
-    sum / Rational::from(scores.len() as u32)
+    sum / S::from_count(scores.len())
 }
 
-fn all_satisfied(scores: &[Rational]) -> bool {
-    let one = one();
-    scores.iter().all(|s| *s == one)
+/// All asserts satisfied. A satisfied assert scores exactly `one`, and scores
+/// never exceed `one`, so `>= one` equals `== one` on the exact path; on the
+/// f64 path it is the necessary *trigger* for an exact re-check (deep `∧`-mean
+/// rounding can nudge a faint violation up to 1.0).
+fn all_satisfied<S: ScoreNum>(scores: &[S]) -> bool {
+    scores.iter().all(|s| *s >= S::one())
 }
 
 /// `(select/Assertion …)` — index of the highest-scoring *unsatisfied* assertion.
-fn select_assertion_idx(scores: &[Rational]) -> usize {
-    let key = |s: &Rational| -> Rational {
-        if *s < one() {
+fn select_assertion_idx<S: ScoreNum>(scores: &[S]) -> usize {
+    let neg_one = S::zero() - S::one();
+    let key = |s: &S| -> S {
+        if *s < S::one() {
             s.clone()
         } else {
-            Rational::from(-1)
+            neg_one.clone()
         }
     };
     let mut best = 0;
@@ -166,32 +167,13 @@ fn eval_with_move(
     scores
 }
 
-// ---------- f64 (approximate) scoring variants (`--f64-score`) ----------
-
-fn average_f64(scores: &[f64]) -> f64 {
-    scores.iter().sum::<f64>() / scores.len() as f64
-}
-
-/// A satisfied atom scores *exactly* 1.0 (boolean early-return), an unsatisfied
-/// one ≤ c < 1; but deep `∧`-mean nesting can round a faint violation up to 1.0,
-/// so this is only a *trigger* for an exact re-check, never the sat decision.
-fn all_satisfied_f64(scores: &[f64]) -> bool {
-    scores.iter().all(|&s| s >= 1.0)
-}
-
-fn select_assertion_idx_f64(scores: &[f64]) -> usize {
-    let key = |s: f64| -> f64 { if s < 1.0 { s } else { -1.0 } };
-    let mut best = 0;
-    let mut best_key = key(scores[0]);
-    for i in 1..scores.len() {
-        let k = key(scores[i]);
-        if k > best_key {
-            best_key = k;
-            best = i;
-        }
-    }
-    best
-}
+// ---------- f64 (approximate) scoring variant (`--f64-score`) ----------
+//
+// `average` / `all_satisfied` / `select_assertion_idx` above are generic over
+// `ScoreNum`, so they serve both the exact and f64 paths directly. Only the
+// buffer plumbing — which `eval_into*` to call — differs, hence the thin
+// `eval_with_move_f64` wrapper below (it mirrors `eval_with_move` but routes to
+// the f64 score buffer).
 
 fn eval_with_move_f64(
     dag: &Dag,
@@ -308,7 +290,7 @@ pub fn sls_vns(
         if params.f64_score {
             // ---- approximate f64-guided step (sat confirmed exactly) ----
             let assert_scores = dag.eval_into_f64(&params.c2, &assignment, &mut sc);
-            if all_satisfied_f64(&assert_scores)
+            if all_satisfied(&assert_scores)
                 && all_satisfied(&dag.eval_into(&params.c2, &assignment, &mut sc))
             {
                 if params.stats {
@@ -316,11 +298,11 @@ pub fn sls_vns(
                 }
                 return SolveResult::Sat(dag.models(&assignment));
             }
-            let curr_score = average_f64(&assert_scores);
+            let curr_score = average(&assert_scores);
             if params.debug {
                 eprintln!("[vns] step {step} (ni={ni}): score {curr_score:.6}");
             }
-            let cand_idx = select_assertion_idx_f64(&assert_scores);
+            let cand_idx = select_assertion_idx(&assert_scores);
             let cand_vars = dag.assert_var_names(cand_idx);
             let mut moves: Vec<(&str, Value)> = Vec::new();
             for &var in &cand_vars {
@@ -333,11 +315,11 @@ pub fn sls_vns(
                 None
             } else {
                 let mut best = 0;
-                let mut best_score = average_f64(&eval_with_move_f64(
+                let mut best_score = average(&eval_with_move_f64(
                     &dag, &params.c2, &mut assignment, &mut sc, moves[0].0, &moves[0].1,
                 ));
                 for i in 1..moves.len() {
-                    let s = average_f64(&eval_with_move_f64(
+                    let s = average(&eval_with_move_f64(
                         &dag, &params.c2, &mut assignment, &mut sc, moves[i].0, &moves[i].1,
                     ));
                     if s > best_score {
