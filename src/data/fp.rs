@@ -470,7 +470,7 @@ impl FloatingPoint {
             debug_assert!(sig >= two_pow(sig_wo) && sig < two_pow(sig_width));
             // normal threshold: exp >= (1 - bias) - sig_wo
             let threshold = (Integer::from(1) - &exp_bias) - Integer::from(sig_wo);
-            let mag = if Integer::from(exp) >= threshold {
+            let mag = if exp >= threshold {
                 // normals
                 let biased = (Integer::from(exp) + &exp_bias) + Integer::from(sig_wo);
                 (biased << sig_wo) + Integer::from(&sig % &two_pow(sig_width - 1))

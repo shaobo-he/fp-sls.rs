@@ -121,7 +121,7 @@ enum Node {
     False,
     And(Vec<Id>),
     Or(Vec<Id>),
-    AtomNode(Atom, bool, Id, Id), // kind, negated, term children
+    Pred(Atom, bool, Id, Id), // kind, negated, term children
     BoolTerm(bool, Id),           // bare boolean term (width-1 BV), negated or not
 }
 
@@ -321,7 +321,7 @@ impl Builder {
                 let kind = Atom::from_head(h).unwrap();
                 let a = self.build_term(&items[1], scope);
                 let b = self.build_term(&items[2], scope);
-                self.push(Node::AtomNode(kind, neg, a, b))
+                self.push(Node::Pred(kind, neg, a, b))
             }
             _ => {
                 // a boolean-valued term (e.g. (fp.isNormal x))
@@ -524,7 +524,7 @@ impl Dag {
                         Node::Var(idx) => vars.push(*idx),
                         Node::Const(_) | Node::True | Node::False => {}
                         Node::Term(_, ch) | Node::And(ch) | Node::Or(ch) => stack.extend(ch),
-                        Node::AtomNode(_, _, a, b) => {
+                        Node::Pred(_, _, a, b) => {
                             stack.push(*a);
                             stack.push(*b);
                         }
@@ -673,7 +673,7 @@ impl Dag {
                 }
                 scr[id] = Some(m);
             }
-            Node::AtomNode(kind, neg, a, b) => {
+            Node::Pred(kind, neg, a, b) => {
                 scr[id] = Some(score_atom(c, kind.head(), *neg, &v(val, *a), &v(val, *b)));
             }
             Node::BoolTerm(neg, t) => {

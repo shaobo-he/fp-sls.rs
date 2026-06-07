@@ -467,7 +467,7 @@ fn select_assertion_ucb(assert_scores: &[Rational], selected: &[u64], moves: u64
     let mut best = None;
     let mut best_pri = f64::NEG_INFINITY;
     for (i, s) in assert_scores.iter().enumerate() {
-        if *s >= Rational::from(1) {
+        if *s >= 1 {
             continue; // only unsatisfied assertions
         }
         // An unexplored assertion is selected first.

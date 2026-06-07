@@ -130,7 +130,7 @@ fn parse_args() -> Result<Options, String> {
             "--c2" => {
                 let v = next("--c2")?;
                 let r = parse_decimal_or_ratio(&v).ok_or("not a valid score scaling constant")?;
-                if r < 0 || r > Rational::from(1) {
+                if !(0..=1).contains(&r) {
                     return Err("not a valid score scaling constant".into());
                 }
                 opts.c2 = r;
