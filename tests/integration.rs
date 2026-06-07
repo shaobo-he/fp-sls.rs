@@ -23,6 +23,7 @@ fn params(step: usize) -> Params {
         wp: 0.001,
         debug: false,
         stats: false,
+        f64_score: false,
     }
 }
 
