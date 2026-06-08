@@ -116,6 +116,7 @@ enum Node {
     Const(Value),
     Var(u32), // index into `vars`
     Term(Op, Vec<Id>),
+    Ite(Id, Id, Id), // term-level if-then-else: boolean cond, then/else term children
     // ----- boolean nodes (produce a score) -----
     True,
     False,
@@ -236,6 +237,13 @@ impl Builder {
             panic!("unsupported term head: {}", items[0]);
         }
         let head = items[0].as_sym().expect("term operator");
+        // term-level if-then-else: condition is boolean, the two branches are terms
+        if head == "ite" {
+            let cond = self.build_bool(&items[1], false, scope);
+            let a = self.build_term(&items[2], scope);
+            let b = self.build_term(&items[3], scope);
+            return self.push(Node::Ite(cond, a, b));
+        }
         let child = |b: &mut Self, i: usize| b.build_term(&items[i], scope);
         let (op, kids): (Op, Vec<Id>) = match head {
             "bvneg" => (Op::BvNeg, vec![child(self, 1)]),
@@ -528,6 +536,11 @@ impl Dag {
                             stack.push(*a);
                             stack.push(*b);
                         }
+                        Node::Ite(c, a, b) => {
+                            stack.push(*c);
+                            stack.push(*a);
+                            stack.push(*b);
+                        }
                         Node::BoolTerm(_, t) => stack.push(*t),
                     }
                 }
@@ -649,6 +662,17 @@ impl Dag {
             Node::Term(op, ch) => {
                 let r = self.apply_op(*op, ch, val);
                 val[id] = Some(r);
+            }
+            Node::Ite(cond, a, b) => {
+                // the boolean condition is true iff its score is exactly 1
+                // (satisfied atoms score exactly one(), preserved by ∧-mean/∨-max
+                // in both Rational and f64), so this select is exact.
+                let taken = if scr[*cond as usize] == Some(S::one()) {
+                    *a
+                } else {
+                    *b
+                };
+                val[id] = Some(v(val, taken));
             }
             Node::True => scr[id] = Some(S::one()),
             Node::False => scr[id] = Some(S::zero()),
