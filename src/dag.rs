@@ -36,6 +36,7 @@ enum Op {
     BvAnd,
     BvOr,
     FpNeg,
+    FpAbs,
     FpAdd(RM),
     FpSub(RM),
     FpMul(RM),
@@ -256,6 +257,7 @@ impl Builder {
             "bvand" => (Op::BvAnd, vec![child(self, 1), child(self, 2)]),
             "bvor" => (Op::BvOr, vec![child(self, 1), child(self, 2)]),
             "fp.neg" => (Op::FpNeg, vec![child(self, 1)]),
+            "fp.abs" => (Op::FpAbs, vec![child(self, 1)]),
             "fp.add" => (Op::FpAdd(RM::of(rm(&items[1]))), vec![child(self, 2), child(self, 3)]),
             "fp.sub" => (Op::FpSub(RM::of(rm(&items[1]))), vec![child(self, 2), child(self, 3)]),
             "fp.mul" => (Op::FpMul(RM::of(rm(&items[1]))), vec![child(self, 2), child(self, 3)]),
@@ -720,6 +722,7 @@ impl Dag {
             Op::BvAnd => Value::BV(bv(0).bvand(bv(1))),
             Op::BvOr => Value::BV(bv(0).bvor(bv(1))),
             Op::FpNeg => Value::FP(fp(0).fpneg()),
+            Op::FpAbs => Value::FP(fp(0).fpabs()),
             Op::FpAdd(r) => Value::FP(fp(0).fpadd(fp(1), r.round())),
             Op::FpSub(r) => Value::FP(fp(0).fpsub(fp(1), r.round())),
             Op::FpMul(r) => Value::FP(fp(0).fpmul(fp(1), r.round())),
@@ -816,6 +819,18 @@ mod tests {
              (declare-fun b () (_ BitVec 8))\n\
              (assert (bvult (bvadd a b) a))\n\
              (assert (= (bvand a b) b))\n\
+             (check-sat)",
+        );
+    }
+
+    #[test]
+    fn dag_matches_score_fp_abs() {
+        // fp.abs must agree between the DAG evaluator and the reference score()/eval
+        check(
+            "(declare-fun x () Float32)\n\
+             (declare-fun y () Float32)\n\
+             (assert (fp.lt (fp.abs (fp.sub roundNearestTiesToEven x y)) y))\n\
+             (assert (fp.gt (fp.abs x) (fp.neg y)))\n\
              (check-sat)",
         );
     }
