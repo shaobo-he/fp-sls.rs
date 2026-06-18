@@ -753,4 +753,58 @@ mod tests {
         let up = one.fpdiv(&three, Round::Up).to_f64();
         assert!(down < up, "toward -inf must be < toward +inf for 1/3");
     }
+
+    #[test]
+    fn fpabs_signs_and_zeros() {
+        for &(eb, sb) in &[(8u32, 24u32), (11, 53)] {
+            let pos = FloatingPoint::real_from_f64(2.5, eb, sb);
+            let neg = FloatingPoint::real_from_f64(-2.5, eb, sb);
+            // |+x| = +x and |-x| = +x (same magnitude, positive)
+            assert_eq!(pos.fpabs().to_f64(), 2.5);
+            assert_eq!(neg.fpabs().to_f64(), 2.5);
+            assert!(pos.fpabs().is_positive());
+            assert!(neg.fpabs().is_positive() && !neg.fpabs().is_negative());
+            // signed zeros: |+0| = |-0| = +0
+            let pz = FloatingPoint::real_from_f64(0.0, eb, sb);
+            let nz = FloatingPoint::real_from_f64(-0.0, eb, sb);
+            assert!(pz.fpabs().is_zero() && pz.fpabs().is_positive());
+            assert!(nz.fpabs().is_zero() && nz.fpabs().is_positive() && !nz.fpabs().is_negative());
+        }
+    }
+
+    #[test]
+    fn fpabs_inf_and_nan() {
+        // Float32 +inf=0x7F800000, -inf=0xFF800000
+        let pinf = FloatingPoint::from_bitvec(&bv32(0x7F80_0000), 8, 24);
+        let ninf = FloatingPoint::from_bitvec(&bv32(0xFF80_0000), 8, 24);
+        assert!(pinf.fpabs().is_infinity() && pinf.fpabs().is_positive());
+        assert!(ninf.fpabs().is_infinity() && ninf.fpabs().is_positive());
+        // |NaN| is NaN
+        assert!(FloatingPoint::nan(8, 24).fpabs().is_nan());
+        assert!(FloatingPoint::nan(11, 53).fpabs().is_nan());
+    }
+
+    #[test]
+    fn fpabs_subnormal() {
+        // smallest positive subnormal Float32 (bits=1) and its negative (sign bit set)
+        let sub = FloatingPoint::from_bitvec(&bv32(1), 8, 24);
+        let neg_sub = FloatingPoint::from_bitvec(&bv32(0x8000_0001), 8, 24);
+        assert!(sub.is_subnormal() && neg_sub.is_subnormal());
+        // abs of either is the same positive subnormal (bits=1)
+        assert_eq!(sub.fpabs().to_bitvec().value, Integer::from(1u64));
+        assert_eq!(neg_sub.fpabs().to_bitvec().value, Integer::from(1u64));
+    }
+
+    #[test]
+    fn fpabs_idempotent_and_matches_neg() {
+        for val in [3.75_f64, -3.75, 0.0, -0.0, 1e-30, -1e30] {
+            let x = FloatingPoint::real_from_f64(val, 8, 24);
+            // result is never negative
+            assert!(!x.fpabs().is_negative());
+            // idempotent: ||x|| = |x|
+            assert_eq!(x.fpabs().fpabs().to_bitvec().value, x.fpabs().to_bitvec().value);
+            // |-x| = |x|
+            assert_eq!(x.fpneg().fpabs().to_bitvec().value, x.fpabs().to_bitvec().value);
+        }
+    }
 }

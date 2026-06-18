@@ -124,6 +124,7 @@ fn eval_list(items: &[Sexp], asn: &Assignment, env: &[(String, Value)]) -> Value
         "fp.mul" => Value::FP(fp(2).fpmul(&fp(3), rm(&items[1]))),
         "fp.div" => Value::FP(fp(2).fpdiv(&fp(3), rm(&items[1]))),
         "fp.neg" => Value::FP(fp(1).fpneg()),
+        "fp.abs" => Value::FP(fp(1).fpabs()),
         "fp.sqrt" => Value::FP(fp(2).fpsqrt(rm(&items[1]))),
 
         // floating-point predicates (yield width-1 bit-vectors)
