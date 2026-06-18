@@ -2,3 +2,6 @@
 /.claude
 **/*.rs.bk
 *.smt2.tmp
+
+# local eval harness scratch (relocate to benchmarks repo)
+bench/benchexec/
