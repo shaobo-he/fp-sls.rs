@@ -227,16 +227,35 @@ impl FloatingPoint {
 
     // ----- core arithmetic with renormalization -----
 
+    /// Apply the format's exponent range (`exp_width`) to an MPFR result that was
+    /// computed at `prec = sig_width`. MPFR's precision bounds only the
+    /// *significand*; its exponent is essentially unbounded and it has no
+    /// subnormals, so we must clamp overflow → ±∞/±max and round gradual underflow
+    /// → subnormal. (Verified: rug's default exponent range is ±2^30, far wider
+    /// than any IEEE format, and it keeps full precision below the subnormal
+    /// threshold — so this step is required for IEEE faithfulness.)
+    ///
+    /// Detection is by EXPONENT rather than by rebuilding `maximum_normal` /
+    /// `maximum_subnormal` every op (which went through `from_bitvec`→`Rational`→
+    /// `gcd` and dominated the profile). In MPFR's `get_exp` convention
+    /// (value = m·2^e, ½ ≤ |m| < 1) the largest normal has exponent `2^(eb-1)` and
+    /// the smallest normal has exponent `3 - 2^(eb-1)` — i.e. f32 MAX_EXP=128 /
+    /// MIN_EXP=−125, f64 1024 / −1021. The rare overflow/subnormal paths are
+    /// unchanged.
     fn renormalize(value: Float, exp_width: u32, sig_width: u32, round: Round) -> FloatingPoint {
-        // overflow → ±∞ or ±max-normal, depending on the mode and sign.
-        let max_normal = FloatingPoint::maximum_normal(exp_width, sig_width);
-        let abs = Float::with_val(sig_width, value.abs_ref());
-        if abs > max_normal.value {
+        let emax = 1i32 << (exp_width - 1);
+        // zero / ±∞ / NaN have no exponent and are already valid format values.
+        let exp = match value.get_exp() {
+            None => return FloatingPoint::new(exp_width, sig_width, value),
+            Some(e) => e,
+        };
+        if exp > emax {
+            // overflow → ±∞ or ±max-normal, depending on mode and sign (rare).
+            let max_normal = FloatingPoint::maximum_normal(exp_width, sig_width);
             let neg = value.is_sign_negative();
             let pinf = || FloatingPoint::plus_inf(exp_width, sig_width);
             let ninf = || FloatingPoint::minus_inf(exp_width, sig_width);
             return match round {
-                // nearest / ties-away overflow to infinity
                 Round::Nearest | Round::AwayZero => {
                     if neg {
                         ninf()
@@ -244,7 +263,6 @@ impl FloatingPoint {
                         pinf()
                     }
                 }
-                // toward zero never overflows to infinity
                 Round::Zero => {
                     if neg {
                         max_normal.fpneg()
@@ -252,7 +270,6 @@ impl FloatingPoint {
                         max_normal
                     }
                 }
-                // toward +∞
                 Round::Up => {
                     if neg {
                         max_normal.fpneg()
@@ -260,7 +277,6 @@ impl FloatingPoint {
                         pinf()
                     }
                 }
-                // toward −∞
                 Round::Down => {
                     if neg {
                         ninf()
@@ -277,9 +293,8 @@ impl FloatingPoint {
                 }
             };
         }
-        // nonzero but |result| ≤ max subnormal → round into the subnormal grid.
-        let max_sub = FloatingPoint::maximum_subnormal(exp_width, sig_width);
-        if !value.is_zero() && abs <= max_sub.value {
+        if exp < 3 - emax {
+            // |result| < smallest normal → round into the subnormal grid (rare).
             return FloatingPoint::round_to_subnormal(&value, exp_width, sig_width, round);
         }
         FloatingPoint::new(exp_width, sig_width, value)
@@ -752,6 +767,44 @@ mod tests {
         let down = one.fpdiv(&three, Round::Down).to_f64();
         let up = one.fpdiv(&three, Round::Up).to_f64();
         assert!(down < up, "toward -inf must be < toward +inf for 1/3");
+    }
+
+    #[test]
+    fn renormalize_is_ieee_correct() {
+        // Ground truth: rounding an MPFR result to (8,24)/(11,53) must equal
+        // rounding it to the native f32/f64. Swept over exponents from deep
+        // subnormal through normal to overflow, both signs, all mantissas — this
+        // includes the subnormal/normal boundary sliver. (Round-to-nearest; Rust's
+        // `as` cast is round-to-nearest-even, matching MPFR's Nearest.)
+        for &(eb, sb) in &[(8u32, 24u32), (11u32, 53u32)] {
+            let emax = 1i32 << (eb - 1);
+            let mants = [
+                Integer::from(1),
+                Integer::from(0b1011u32),
+                Integer::from((1u64 << (sb - 1)) | 0xAB),
+                (Integer::from(1) << sb) - 1,
+            ];
+            for exp_off in -(2 * emax + sb as i32 + 8)..=(emax + 8) {
+                for m in &mants {
+                    for &sign in &[1i32, -1] {
+                        let base = FloatingPoint::from_sig_exp(sb, m.clone(), exp_off);
+                        let v = if sign < 0 { -base } else { base };
+                        let got =
+                            FloatingPoint::renormalize(v.clone(), eb, sb, Round::Nearest).to_f64();
+                        // native ground truth (v at prec sb is exact in f64)
+                        let truth = if sb == 24 {
+                            (v.to_f64() as f32) as f64
+                        } else {
+                            v.to_f64()
+                        };
+                        assert!(
+                            got == truth || (got.is_nan() && truth.is_nan()),
+                            "fmt {eb},{sb} exp={exp_off} sign={sign}: got={got:e} truth={truth:e}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
