@@ -95,6 +95,48 @@ fn round_rational(num: Integer, den: &Integer, round: Round, negative: bool) -> 
     }
 }
 
+/// Which arithmetic operation `arith` performs — lets it compute both the fast
+/// MPFR result and, when a single exact rounding is required, the exact result.
+#[derive(Clone, Copy)]
+enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Sqrt,
+    Id,
+}
+
+/// `floor(log2(num/den))` for positive integers: the unique `e` with
+/// `2^e <= num/den < 2^(e+1)`. Exact (no flooring of intermediate ratios).
+fn floor_log2(num: &Integer, den: &Integer) -> i64 {
+    let ge_pow2 = |e: i64| -> bool {
+        // num/den >= 2^e  <=>  num >= den*2^e (e>=0)  or  num*2^-e >= den (e<0)
+        if e >= 0 {
+            *num >= Integer::from(den << (e as u32))
+        } else {
+            Integer::from(num << ((-e) as u32)) >= *den
+        }
+    };
+    let mut e = num.significant_bits() as i64 - den.significant_bits() as i64 - 1;
+    while ge_pow2(e + 1) {
+        e += 1;
+    }
+    while !ge_pow2(e) {
+        e -= 1;
+    }
+    e
+}
+
+/// `num/den * 2^scale` as an exact integer ratio `(p, q)` with `q > 0`.
+fn scale_ratio(num: &Integer, den: &Integer, scale: i64) -> (Integer, Integer) {
+    if scale >= 0 {
+        (Integer::from(num << (scale as u32)), den.clone())
+    } else {
+        (num.clone(), Integer::from(den << ((-scale) as u32)))
+    }
+}
+
 impl FloatingPoint {
     pub fn new(exp_width: u32, sig_width: u32, value: Float) -> FloatingPoint {
         FloatingPoint {
@@ -227,169 +269,285 @@ impl FloatingPoint {
 
     // ----- core arithmetic with renormalization -----
 
-    /// Apply the format's exponent range (`exp_width`) to an MPFR result that was
-    /// computed at `prec = sig_width`. MPFR's precision bounds only the
-    /// *significand*; its exponent is essentially unbounded and it has no
-    /// subnormals, so we must clamp overflow → ±∞/±max and round gradual underflow
-    /// → subnormal. (Verified: rug's default exponent range is ±2^30, far wider
-    /// than any IEEE format, and it keeps full precision below the subnormal
-    /// threshold — so this step is required for IEEE faithfulness.)
+    /// Compute `op` at precision `sig_width` with rounding `round`, then map the
+    /// result into the format's exponent range.
     ///
-    /// Detection is by EXPONENT rather than by rebuilding `maximum_normal` /
-    /// `maximum_subnormal` every op (which went through `from_bitvec`→`Rational`→
-    /// `gcd` and dominated the profile). In MPFR's `get_exp` convention
-    /// (value = m·2^e, ½ ≤ |m| < 1) the largest normal has exponent `2^(eb-1)` and
-    /// the smallest normal has exponent `3 - 2^(eb-1)` — i.e. f32 MAX_EXP=128 /
-    /// MIN_EXP=−125, f64 1024 / −1021. The rare overflow/subnormal paths are
-    /// unchanged.
-    fn renormalize(value: Float, exp_width: u32, sig_width: u32, round: Round) -> FloatingPoint {
-        let emax = 1i32 << (exp_width - 1);
-        // zero / ±∞ / NaN have no exponent and are already valid format values.
-        let exp = match value.get_exp() {
-            None => return FloatingPoint::new(exp_width, sig_width, value),
-            Some(e) => e,
-        };
-        if exp > emax {
-            // overflow → ±∞ or ±max-normal, depending on mode and sign (rare).
-            let max_normal = FloatingPoint::maximum_normal(exp_width, sig_width);
-            let neg = value.is_sign_negative();
-            let pinf = || FloatingPoint::plus_inf(exp_width, sig_width);
-            let ninf = || FloatingPoint::minus_inf(exp_width, sig_width);
-            return match round {
-                Round::Nearest | Round::AwayZero => {
-                    if neg {
-                        ninf()
-                    } else {
-                        pinf()
-                    }
-                }
-                Round::Zero => {
-                    if neg {
-                        max_normal.fpneg()
-                    } else {
-                        max_normal
-                    }
-                }
-                Round::Up => {
-                    if neg {
-                        max_normal.fpneg()
-                    } else {
-                        pinf()
-                    }
-                }
-                Round::Down => {
-                    if neg {
-                        ninf()
-                    } else {
-                        max_normal
-                    }
-                }
-                _ => {
-                    if neg {
-                        ninf()
-                    } else {
-                        pinf()
-                    }
-                }
-            };
-        }
-        if exp < 3 - emax {
-            // |result| < smallest normal → round into the subnormal grid (rare).
-            return FloatingPoint::round_to_subnormal(&value, exp_width, sig_width, round);
-        }
-        FloatingPoint::new(exp_width, sig_width, value)
-    }
-
-    /// Apply `op` at precision `sig` with rounding `round`, then renormalize.
-    fn arith<F>(&self, o: &FloatingPoint, round: Round, op: F) -> FloatingPoint
-    where
-        F: Fn(&Float, &Float, u32, Round) -> Float,
-    {
+    /// The fast MPFR path is IEEE-correct for RNE/RTZ/RTP/RTN in the normal and
+    /// overflow regimes: there the result is already exactly the format value. Two
+    /// cases instead need an exact single rounding:
+    ///   * `Round::AwayZero` (SMT-LIB roundNearestTiesToAway): MPFR has no
+    ///     nearest-ties-away mode, so `with_val_round` used the *directed* RNDA.
+    ///   * a subnormal result: the fast path would round twice (to `sig_width`,
+    ///     then onto the coarser subnormal grid), double-rounding for nearest
+    ///     modes. Rounding the exact result once is correct.
+    ///
+    /// Classification is by EXPONENT (MPFR `get_exp` convention value = m·2^e,
+    /// ½ ≤ |m| < 1): the largest normal has exponent `2^(eb-1)`, the smallest
+    /// normal `3 - 2^(eb-1)` (f32 128 / −125, f64 1024 / −1021). This avoids
+    /// rebuilding `maximum_normal`/`maximum_subnormal` (→ Rational → gcd) per op,
+    /// and the operand/rational work stays off the common (normal) hot path.
+    fn arith(&self, o: &FloatingPoint, round: Round, op: ArithOp) -> FloatingPoint {
         assert!(
             self.value.prec() == o.value.prec()
                 && self.exp_width == o.exp_width
                 && self.sig_width == o.sig_width,
             "invalid arithmetic operation"
         );
-        let result = op(&self.value, &o.value, self.prec(), round);
-        FloatingPoint::renormalize(result, self.exp_width, self.sig_width, round)
+        let p = self.prec();
+        let result = match op {
+            ArithOp::Add => Float::with_val_round(p, &self.value + &o.value, round).0,
+            ArithOp::Sub => Float::with_val_round(p, &self.value - &o.value, round).0,
+            ArithOp::Mul => Float::with_val_round(p, &self.value * &o.value, round).0,
+            ArithOp::Div => Float::with_val_round(p, &self.value / &o.value, round).0,
+            ArithOp::Sqrt => Float::with_val_round(p, self.value.sqrt_ref(), round).0,
+            ArithOp::Id => Float::with_val_round(p, &self.value, round).0,
+        };
+        let emax = 1i32 << (self.exp_width - 1);
+        // zero / ±∞ / NaN have no exponent and are already valid format values.
+        let exp = match result.get_exp() {
+            None => return FloatingPoint::new(self.exp_width, self.sig_width, result),
+            Some(e) => e,
+        };
+        // Exact single-rounding path (rare): RNA, or a subnormal result. Only here
+        // do we touch the operands — keeping `is_finite`/rational off the hot path.
+        if (round == Round::AwayZero || exp < 3 - emax)
+            && self.value.is_finite()
+            && o.value.is_finite()
+        {
+            if let Some(rv) = self.exact_result(o, op) {
+                if rv != 0 {
+                    return FloatingPoint::round_rational_to_format(
+                        &rv,
+                        self.exp_width,
+                        self.sig_width,
+                        round,
+                    );
+                }
+            }
+        }
+        if exp > emax {
+            // overflow → ±∞ or ±max-normal, depending on mode and sign (rare).
+            return FloatingPoint::overflow_value(
+                self.exp_width,
+                self.sig_width,
+                round,
+                result.is_sign_negative(),
+            );
+        }
+        // normal range: the MPFR result is already exactly the format value.
+        FloatingPoint::new(self.exp_width, self.sig_width, result)
+    }
+
+    /// Exact rational value of the operation on the (finite) operands, used by the
+    /// single-rounding path. `sqrt` is irrational, so it returns a high-precision
+    /// faithful rational; `sqrt` never produces a subnormal result, so that path
+    /// is only reached for `Round::AwayZero`, where an operation result is never
+    /// within `2^-(2·sig+18)` of a grid midpoint without being exactly on it.
+    fn exact_result(&self, o: &FloatingPoint, op: ArithOp) -> Option<Rational> {
+        if let ArithOp::Sqrt = op {
+            return Float::with_val(2 * self.sig_width + 18, self.value.sqrt_ref()).to_rational();
+        }
+        let a = self.value.to_rational()?;
+        Some(match op {
+            ArithOp::Add => a + o.value.to_rational()?,
+            ArithOp::Sub => a - o.value.to_rational()?,
+            ArithOp::Mul => a * o.value.to_rational()?,
+            ArithOp::Div => {
+                let b = o.value.to_rational()?;
+                if b == 0 {
+                    return None;
+                }
+                a / b
+            }
+            ArithOp::Id => a,
+            ArithOp::Sqrt => unreachable!(),
+        })
     }
 
     pub fn fpadd(&self, o: &FloatingPoint, round: Round) -> FloatingPoint {
-        self.arith(o, round, |a, b, p, r| Float::with_val_round(p, a + b, r).0)
+        self.arith(o, round, ArithOp::Add)
     }
     pub fn fpsub(&self, o: &FloatingPoint, round: Round) -> FloatingPoint {
-        self.arith(o, round, |a, b, p, r| Float::with_val_round(p, a - b, r).0)
+        self.arith(o, round, ArithOp::Sub)
     }
     pub fn fpmul(&self, o: &FloatingPoint, round: Round) -> FloatingPoint {
-        self.arith(o, round, |a, b, p, r| Float::with_val_round(p, a * b, r).0)
+        self.arith(o, round, ArithOp::Mul)
     }
     pub fn fpdiv(&self, o: &FloatingPoint, round: Round) -> FloatingPoint {
-        self.arith(o, round, |a, b, p, r| Float::with_val_round(p, a / b, r).0)
+        self.arith(o, round, ArithOp::Div)
     }
     pub fn fpsqrt(&self, round: Round) -> FloatingPoint {
-        self.arith(self, round, |a, _, p, r| {
-            Float::with_val_round(p, a.sqrt_ref(), r).0
-        })
+        self.arith(self, round, ArithOp::Sqrt)
     }
 
     /// `(fp/prune fp)` — push a value through renormalization in mode `round`.
     pub fn prune(&self, round: Round) -> FloatingPoint {
-        self.arith(self, round, |a, _, p, r| Float::with_val_round(p, a, r).0)
+        self.arith(self, round, ArithOp::Id)
     }
 
-    /// `(fp/round-to-subnormal v exp sig)` in mode `round`.
-    fn round_to_subnormal(
-        v: &Float,
+    /// Round an exact, finite, NONZERO rational `rv` once to the IEEE
+    /// `(exp_width, sig_width)` format with `round`. Single rounding (no
+    /// double-rounding) and correct for all five modes, including
+    /// nearest-ties-away (`Round::AwayZero`), which MPFR cannot do natively.
+    fn round_rational_to_format(
+        rv: &Rational,
         exp_width: u32,
         sig_width: u32,
         round: Round,
     ) -> FloatingPoint {
-        let subnormal_min = FloatingPoint::from_bitvec(
-            &BitVec::new(exp_width + sig_width, Integer::from(1)),
-            exp_width,
-            sig_width,
-        )
-        .value;
-        let pv = Float::with_val(sig_width, v.abs_ref());
-        let (s1, p1) = pv.to_integer_exp().expect("finite nonzero");
-        let (s2, p2) = subnormal_min.to_integer_exp().expect("finite nonzero");
-        let d = p1 - p2;
-        let (num, den) = if d >= 0 {
-            (s1 << (d as u32), s2)
+        let neg = *rv < 0;
+        let mag = rv.clone().abs();
+        let num = Integer::from(mag.numer());
+        let den = Integer::from(mag.denom());
+        let sig_wo = sig_width - 1;
+        let bias = (1i64 << (exp_width - 1)) - 1;
+        let e_min = 1 - bias; // smallest normal unbiased exponent
+        let e_max = bias; // largest normal unbiased exponent
+
+        // floor(log2(mag)): unique e with 2^e <= mag < 2^(e+1).
+        let e = floor_log2(&num, &den);
+
+        let (sig_int, exp_unbiased, subnormal) = if e >= e_min {
+            // normal candidate: round mag / 2^(e - sig_wo) to an integer significand.
+            let scale = sig_wo as i64 - e;
+            let (p, q) = scale_ratio(&num, &den, scale);
+            let mut m = round_rational(p, &q, round, neg);
+            let mut exp_u = e;
+            if m == (Integer::from(1) << sig_width) {
+                // 1.11..1 rounded up to 10.00..0: carry into the next binade.
+                m >>= 1;
+                exp_u += 1;
+            }
+            (m, exp_u, false)
         } else {
-            (s1, s2 << ((-d) as u32))
+            // subnormal candidate: fixed grid step 2^(e_min - sig_wo).
+            let scale = sig_wo as i64 - e_min;
+            let (p, q) = scale_ratio(&num, &den, scale);
+            (round_rational(p, &q, round, neg), e_min, true)
         };
-        let neg = v.is_sign_negative();
-        let r = round_rational(num, &den, round, neg);
-        if r < 1 {
-            FloatingPoint::real_from_f64(if neg { -0.0 } else { 0.0 }, exp_width, sig_width)
-        } else {
-            let rv = FloatingPoint::from_bitvec(
-                &BitVec::new(exp_width + sig_width, r),
+
+        if subnormal {
+            if sig_int == 0 {
+                return FloatingPoint::signed_zero(exp_width, sig_width, neg);
+            }
+            // sig_int in [1, 2^sig_wo]; the bit pattern equals sig_int, and the
+            // value 2^sig_wo encodes the smallest normal (the rounded-up case).
+            let fp = FloatingPoint::from_bitvec(
+                &BitVec::new(exp_width + sig_width, sig_int),
                 exp_width,
                 sig_width,
             );
-            if neg {
-                rv.fpneg()
-            } else {
-                rv
+            return if neg { fp.fpneg() } else { fp };
+        }
+        if exp_unbiased > e_max {
+            return FloatingPoint::overflow_value(exp_width, sig_width, round, neg);
+        }
+        let biased = Integer::from(exp_unbiased + bias);
+        let frac = Integer::from(&sig_int) - (Integer::from(1) << sig_wo);
+        let pattern = (biased << sig_wo) + frac;
+        let fp = FloatingPoint::from_bitvec(
+            &BitVec::new(exp_width + sig_width, pattern),
+            exp_width,
+            sig_width,
+        );
+        if neg {
+            fp.fpneg()
+        } else {
+            fp
+        }
+    }
+
+    /// Signed zero of the given format.
+    fn signed_zero(exp_width: u32, sig_width: u32, neg: bool) -> FloatingPoint {
+        FloatingPoint::special(exp_width, sig_width, if neg { -0.0 } else { 0.0 })
+    }
+
+    /// The format value an overflow rounds to, per mode and sign.
+    fn overflow_value(exp_width: u32, sig_width: u32, round: Round, neg: bool) -> FloatingPoint {
+        let max_normal = FloatingPoint::maximum_normal(exp_width, sig_width);
+        let pinf = || FloatingPoint::plus_inf(exp_width, sig_width);
+        let ninf = || FloatingPoint::minus_inf(exp_width, sig_width);
+        match round {
+            Round::Nearest | Round::AwayZero => {
+                if neg {
+                    ninf()
+                } else {
+                    pinf()
+                }
+            }
+            Round::Zero => {
+                if neg {
+                    max_normal.fpneg()
+                } else {
+                    max_normal
+                }
+            }
+            Round::Up => {
+                if neg {
+                    max_normal.fpneg()
+                } else {
+                    pinf()
+                }
+            }
+            Round::Down => {
+                if neg {
+                    ninf()
+                } else {
+                    max_normal
+                }
+            }
+            _ => {
+                if neg {
+                    ninf()
+                } else {
+                    pinf()
+                }
             }
         }
     }
 
-    /// `(eval/fpconv fp dest-exp dest-sig)` in mode `round`.
+    /// `(eval/fpconv fp dest-exp dest-sig)` in mode `round`. Rounds the exact
+    /// source value once into the destination format (no double-rounding).
     pub fn fpconv(&self, dest_exp: u32, dest_sig: u32, round: Round) -> FloatingPoint {
-        let copied = FloatingPoint::new(
-            dest_exp,
-            dest_sig,
-            Float::with_val_round(dest_sig, &self.value, round).0,
-        );
-        if self.is_nan() || self.is_infinity() {
-            copied
-        } else {
-            copied.prune(round)
+        if self.is_nan() {
+            return FloatingPoint::nan(dest_exp, dest_sig);
         }
+        if self.is_infinity() {
+            return if self.value.is_sign_negative() {
+                FloatingPoint::minus_inf(dest_exp, dest_sig)
+            } else {
+                FloatingPoint::plus_inf(dest_exp, dest_sig)
+            };
+        }
+        if self.is_zero() {
+            return FloatingPoint::signed_zero(dest_exp, dest_sig, self.signbit() == 1);
+        }
+        // Same fast-path/exact-fallback split as `arith`: the MPFR round into the
+        // destination precision is correct for RNE/RTZ/RTP/RTN in the normal and
+        // overflow regimes; only RNA or a subnormal destination need an exact
+        // single rounding (a wide→narrow convert can underflow into subnormals).
+        let result = Float::with_val_round(dest_sig, &self.value, round).0;
+        let emax = 1i32 << (dest_exp - 1);
+        let exp = match result.get_exp() {
+            None => return FloatingPoint::new(dest_exp, dest_sig, result),
+            Some(e) => e,
+        };
+        if round == Round::AwayZero || exp < 3 - emax {
+            if let Some(rv) = self.value.to_rational() {
+                if rv != 0 {
+                    return FloatingPoint::round_rational_to_format(&rv, dest_exp, dest_sig, round);
+                }
+            }
+        }
+        if exp > emax {
+            return FloatingPoint::overflow_value(
+                dest_exp,
+                dest_sig,
+                round,
+                result.is_sign_negative(),
+            );
+        }
+        FloatingPoint::new(dest_exp, dest_sig, result)
     }
 
     // ----- conversions to/from a real number -----
@@ -400,13 +558,26 @@ impl FloatingPoint {
 
     /// `(real->FloatingPoint rv exp sig)` for a machine double `rv`.
     pub fn real_from_f64(rv: f64, exp_width: u32, sig_width: u32) -> FloatingPoint {
-        FloatingPoint::real_from_float(fl(sig_width, rv), exp_width, sig_width)
+        if rv == 0.0 {
+            return FloatingPoint::signed_zero(exp_width, sig_width, rv.is_sign_negative());
+        }
+        if !rv.is_finite() {
+            // ±∞ / NaN ingest exactly via MPFR (no rounding needed).
+            return FloatingPoint::real_from_float(fl(sig_width, rv), exp_width, sig_width);
+        }
+        // Round the EXACT f64 once into the format (avoids the fl()+prune double
+        // rounding for subnormal targets). `rv` at prec 53 is exact in MPFR.
+        let r = Float::with_val(53, rv).to_rational().expect("finite f64");
+        FloatingPoint::round_rational_to_format(&r, exp_width, sig_width, Round::Nearest)
     }
 
     /// `(real->FloatingPoint rv exp sig)` for an exact rational `rv`
-    /// (used by the Z3 real-model path).
+    /// (used by the Z3 real-model path). Single correct rounding into the format.
     pub fn real_from_rational(rv: &Rational, exp_width: u32, sig_width: u32) -> FloatingPoint {
-        FloatingPoint::real_from_float(fl(sig_width, rv), exp_width, sig_width)
+        if *rv == 0 {
+            return FloatingPoint::signed_zero(exp_width, sig_width, false);
+        }
+        FloatingPoint::round_rational_to_format(rv, exp_width, sig_width, Round::Nearest)
     }
 
     /// `(bigfloat->flonum value)` — used by `fp->real`.
@@ -789,8 +960,11 @@ mod tests {
                     for &sign in &[1i32, -1] {
                         let base = FloatingPoint::from_sig_exp(sb, m.clone(), exp_off);
                         let v = if sign < 0 { -base } else { base };
-                        let got =
-                            FloatingPoint::renormalize(v.clone(), eb, sb, Round::Nearest).to_f64();
+                        // `prune` pushes a value through the format mapping (the
+                        // logic formerly in `renormalize`, now inlined in `arith`).
+                        let got = FloatingPoint::new(eb, sb, v.clone())
+                            .prune(Round::Nearest)
+                            .to_f64();
                         // native ground truth (v at prec sb is exact in f64)
                         let truth = if sb == 24 {
                             (v.to_f64() as f32) as f64
@@ -804,6 +978,67 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn fpconv_matches_native() {
+        // f64 → f32 narrowing under RNE must equal a native `as f32` cast,
+        // including the subnormal range (single rounding, no double-rounding) and
+        // overflow. Native casts are round-to-nearest-even, matching RNE.
+        for &v in &[
+            1.0f64,
+            -2.5,
+            0.1,
+            1e-40,             // normal f64 → subnormal f32
+            1.4e-45,           // ~smallest f32 subnormal
+            7e-46,             // underflows f32 toward zero
+            f64::MIN_POSITIVE, // ~2.2e-308 → 0 in f32
+            3.0e38,            // near f32 max-normal
+            1e40,              // overflows f32
+            -1e40,
+        ] {
+            let wide = FloatingPoint::real_from_f64(v, 11, 53); // exact f64
+            let got = wide.fpconv(8, 24, Round::Nearest).to_f64();
+            let truth = (v as f32) as f64;
+            assert!(
+                got == truth || (got.is_nan() && truth.is_nan()),
+                "fpconv f64→f32 of {v:e}: got {got:e} want {truth:e}"
+            );
+        }
+        // f32 → f64 widening is exact for every f32 (incl. subnormals).
+        for &v in &[1.5f32, -0.25, 1e-40, f32::MIN_POSITIVE, f32::MAX] {
+            let narrow = FloatingPoint::real_from_f64(v as f64, 8, 24);
+            let got = narrow.fpconv(11, 53, Round::Nearest).to_f64();
+            assert_eq!(got, v as f64, "widening {v:e}");
+        }
+    }
+
+    #[test]
+    fn real_from_f64_matches_native() {
+        // Ingesting an f64 into f32 must round the EXACT value once (native cast),
+        // not fl()+prune double-round. First three are subnormal-f32 cases that
+        // double-rounded 1 ULP before the fix.
+        for &v in &[
+            9.997389223688933e-39f64,
+            3.6488262702038793e-39,
+            8.722399999575497e-39,
+            1.0,
+            -2.5,
+            0.1,
+            1e-40,
+            1.4e-45,
+            7e-46,
+            3.0e38,
+            1e40,
+            -1e40,
+        ] {
+            let got = FloatingPoint::real_from_f64(v, 8, 24).to_f64();
+            let truth = (v as f32) as f64;
+            assert!(
+                got == truth || (got.is_nan() && truth.is_nan()),
+                "real_from_f64 {v:e}: got {got:e} want {truth:e}"
+            );
         }
     }
 
