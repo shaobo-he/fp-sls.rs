@@ -154,7 +154,12 @@ fn score_fp_eq_raw<S: ScoreNum>(c: &S, fp1: &FloatingPoint, fp2: &FloatingPoint)
     } else if fp1.to_bitvec().bv_eq(&fp2.to_bitvec()) {
         S::one()
     } else {
-        fp_dist_score(c, fp1, fp2, false)
+        // `eq = true` so any non-bit-equal pair scores strictly < 1. Without it,
+        // +0 and -0 (numerically distance 0 but bit-distinct, so not caught by the
+        // short-circuit above) score exactly c — which is 1 at `--c2 1`, wrongly
+        // marking `(= +0 -0)` satisfied (SMT `=` is bit equality). Genuine
+        // equalities are bit-equal and already returned 1 above.
+        fp_dist_score(c, fp1, fp2, true)
     }
 }
 
@@ -459,4 +464,25 @@ fn score_negation<S: ScoreNum>(
     }
     // `(¬ b)` for a boolean atom `b`.
     score_bool_neg(&ev(inner, asn, env))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B1: `(= +0 -0)` must score strictly below 1 even at c2 = 1, because SMT `=`
+    /// is bit equality (+0 and -0 are distinct) and the sat decision is "score == 1".
+    /// +0/-0 are the unique non-bit-equal pair at distance 0, so without the eq-flag
+    /// they scored exactly c (= 1 at c2=1) → a spurious sat.
+    #[test]
+    fn pos_neg_zero_eq_scores_below_one_at_c1() {
+        let pz = FloatingPoint::real_from_f64(0.0, 8, 24);
+        let nz = FloatingPoint::real_from_f64(-0.0, 8, 24);
+        assert!(pz.to_bitvec().value != nz.to_bitvec().value, "+0 and -0 must differ in bits");
+        let one = Rational::from(1);
+        let s: Rational = score_fp_eq_raw(&one, &pz, &nz);
+        assert!(s < one, "(= +0 -0) at c=1 must score < 1, got {s}");
+        // genuine (bit-equal) equality still scores exactly 1.
+        assert_eq!(score_fp_eq_raw::<Rational>(&one, &pz, &pz), Rational::from(1));
+    }
 }
