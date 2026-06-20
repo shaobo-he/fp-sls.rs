@@ -23,3 +23,8 @@ rand = { version = "0.8", default-features = false, features = ["std", "std_rng"
 
 [profile.release]
 opt-level = 3
+
+# For profiling (cargo flamegraph --profile profiling): release speed + symbols.
+[profile.profiling]
+inherits = "release"
+debug = true
