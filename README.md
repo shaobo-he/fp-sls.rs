@@ -94,10 +94,12 @@ The module layout mirrors the Racket repository for traceability:
 
 ### Key design decisions
 
-* **Floating-point via MPFR.** Racket's `math/bigfloat` is MPFR; the port uses
-  `rug::Float` with precision set to the significand width. MPFR's
-  `to_integer_exp` reproduces `bigfloat->sig+exp` exactly, so BV↔FP conversions,
-  subnormal rounding, and overflow-to-∞ are bit-for-bit faithful for arbitrary
+* **MPFR fast path with format-exact boundary rounding.** Racket's
+  `math/bigfloat` is MPFR; the port uses `rug::Float` at the destination
+  significand width for the common normal-result path. RNA and subnormal results
+  use an explicit single-rounding grid path, avoiding both MPFR's directed
+  away-from-zero mode (which is not nearest-ties-away) and subnormal
+  double-rounding. Overflow is selected explicitly by mode and sign for arbitrary
   `(exp, sig)` formats (Float16/32/64/128 and beyond).
 * **Exact rational scores.** All scores are `rug::Rational`, so `argmax` and the
   improvement test are exact. This realizes the Racket TODO *"add types to score
@@ -248,11 +250,13 @@ exactly 1.
 
 Unlike the Racket original (which ignored the rounding-mode argument and always
 rounded to nearest), the evaluator **honors the rounding mode** of every FP
-operation: all five IEEE modes (`roundNearestTiesToEven`, `roundTowardZero`,
-`roundToward{Positive,Negative}`, `roundNearestTiesToAway`) map to MPFR's, with
-mode-aware overflow (e.g. toward-zero yields max-normal, not ∞). A *non-constant*
-rounding mode is rejected (error) rather than silently treated as nearest, so
-results stay sound.
+operation. The normal-result fast path uses MPFR for
+`roundNearestTiesToEven`, `roundTowardZero`, and
+`roundToward{Positive,Negative}`. Because MPFR's away-from-zero mode is
+directed rather than nearest-ties-away, `roundNearestTiesToAway` uses the
+explicit single-rounding path. Overflow is selected by mode and sign (for
+example, toward zero yields max-normal rather than ∞). A *non-constant* rounding
+mode is rejected instead of silently being treated as nearest.
 
 A `RoundingMode` **variable** is not searched but **enumerated**: the solver
 tries each of the five constants in its place (cartesian product for several
@@ -260,9 +264,12 @@ variables, `roundNearestTiesToEven` first), reporting `sat` as soon as one
 combination succeeds — sound *and* complete over rounding modes. The chosen mode
 is included in the printed model.
 
-(Subnormal results use the same two-step rounding as OL1V3R — round to precision,
-then to the subnormal grid — so they can be off by one ULP exactly at the
-denormal boundary; inherited from the original.)
+Subnormal outputs are rounded once onto the destination grid, avoiding the
+one-ULP double-rounding error inherited from OL1V3R. An executable Isabelle/HOL
+reference model and IEEE soundness development live in
+[`isabelle/`](isabelle/README.md). The theorems establish the HOL model's
+correctness; refinement from the compiled Rust/Rug implementation remains a
+separate proof obligation.
 
 ## Limitations
 

@@ -1,0 +1,34 @@
+chapter HOL
+
+session FP_SLS_Verification = IEEE_Floating_Point +
+  description "
+    Isabelle/HOL models and proofs for fp-sls floating-point conversion.
+  "
+  options [document = false, quick_and_dirty = false, skip_proofs = false]
+  theories
+    Fp_Round_Int
+    Fp_Rational_Scale
+    Fp_Format
+    Fp_Finite_Grid
+    Fp_IEEE_Spec
+    Fp_IEEE_Exact
+    Fp_IEEE_Bridge
+    Fp_SingleNaN_Bridge
+    Fp_Round_Format
+    Fp_Arbitrary_Precision
+    Fp_Round_Value
+    Fp_Signed_Value
+    Fp_Round_Local
+    Fp_Round_Normal
+    Fp_Round_Subnormal
+    Fp_Round_Directed
+    Fp_Round_IEEE
+    Fp_Round_Ties
+    Fp_Round_Nearest_IEEE
+    Fp_Round_Preference
+    Fp_Round_Overflow
+    Fp_Round_Directed_IEEE
+    Fp_Round_Sound
+    Fp_Round_Nearest_Sound
+    Fp_Arbitrary_Precision_Sound
+    Fp_Arbitrary_Precision_Nearest_Sound
