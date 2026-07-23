@@ -92,8 +92,9 @@ The session currently proves all of the following without admissions:
   normal, and signed underflow to zero;
 - global nearest-error minimality against every finite AFP value for normal
   and subnormal RNE/RNA results, including opposite-sign competitors;
-- the full even-LSB and away-from-zero nearest preference for subnormal RNE and
-  RNA, with no explicit midpoint premise;
+- the full even-LSB and away-from-zero nearest preference for normal and
+  subnormal RNE/RNA results, with no explicit midpoint premise, including
+  lower-binade competitors and significand carry;
 - least-above, greatest-below, and toward-zero extremality for all finite
   non-overflow directed results;
 - equality of the dynamic maximum finite magnitude with AFP `fp_largest`, and
@@ -105,21 +106,27 @@ The session currently proves all of the following without admissions:
   of NaN and both infinities.
 
 At the arbitrary-precision source level, the checked `fp_signed_round_rel`
-theorems cover:
+theorems now provide both reusable region results and their complete assembly:
 
 - every zero source in all five modes;
-- nonzero RTP/RTN/RTZ sources under the explicit finite-core condition;
-- nonzero RTP/RTN/RTZ sources beyond maximum finite, with the IEEE endpoint or
+- nonzero RTP/RTN/RTZ sources at or below maximum finite via a proved
+  non-overflow partition, and beyond maximum finite with the IEEE endpoint or
   infinity selected by mode and sign;
-- nonzero subnormal-range RNE/RNA sources, including ties and signed
-  underflow; and
-- nonzero RNE/RNA sources at or beyond the nearest overflow threshold.
+- nonzero RNE/RNA sources below the nearest overflow threshold, automatically
+  partitioned into subnormal and normal cases, and at or above the threshold;
+- explicit subnormal, normal, overflow, and core-condition lemmas for clients
+  that need an individual arithmetic region.
 
-The remaining mathematical gap is the final tie-preference lift for finite
-normal RNE/RNA results.  Their global nearestness and equal-error competitor
-bridges are already proved, but the normal-binade boundary still needs the
-parity/grid-coefficient argument.  Consequently, this checkpoint does not yet
-claim one unconditional all-input theorem for all five modes.
+The theorem `round_ap_binary_signed_sound` assembles these regions into one
+unconditional result for every `ap_binary_float` and all five rounding modes.
+Its only premise is the runtime exponent-width requirement
+`2 ≤ LENGTH('e)`; it covers signed zero, underflow, finite rounding, and
+mode- and sign-dependent overflow.
+
+The former normal-binade tie-preference gap is closed.  An equally-near
+competitor below the binade boundary is ruled out by strict boundary
+distance; every remaining competitor is lifted to the selected normal grid,
+where integer parity or outwardness determines the preferred result.
 
 ### Refinement boundary
 
