@@ -1,10 +1,10 @@
 //! Differential soundness fuzz of fp.rs arithmetic vs. an INDEPENDENT exact
 //! rational IEEE oracle, for all five rounding modes.
 //!
-//! Audits commit 9086440 ("detect overflow/subnormal by exponent in
-//! renormalize"). The oracle is implemented purely with rug::Integer/Rational
-//! (no rug::Float) so it shares no rounding code with the code under test and
-//! performs a SINGLE rounding of the exact result (no double-rounding).
+//! Audits fp.rs's single-rounding implementation across normal, subnormal,
+//! boundary, and overflow regimes. The oracle uses rug::Integer/Rational
+//! (no rug::Float), shares no rounding code with the implementation, and rounds
+//! the exact result once.
 //!
 //! Strategy: build operands from random IEEE bit patterns (so each operand is
 //! exactly representable), decode each operand's EXACT rational value here in
@@ -155,16 +155,14 @@ fn scale_pow2(r: Rational, k: i64) -> Rational {
     }
 }
 
-/// The rounding semantics the oracle applies. We distinguish two readings of
-/// the SMT-LIB `roundNearestTiesToAway` constant:
-///   * `MpfrFaithful`  — model exactly what rug/MPFR does for each `Round`
-///     variant fp.rs passes in. CRUCIALLY `Round::AwayZero` in MPFR is
-///     *directed* "round away from zero" (MPFR_RNDA), NOT nearest-ties-away.
-///     This pass audits whether `renormalize` is correct given fp.rs's *actual*
-///     in-effect semantics.
-///   * `SmtLib`        — the IEEE/SMT-LIB intent: RNA = round to nearest, ties
-///     away from zero. fp.rs maps RNA -> Round::AwayZero, so this pass measures
-///     fp.rs's divergence from the SMT-LIB spec.
+/// The rounding semantics the oracle applies. Two readings are retained so the
+/// RNA regression can contrast the fixed implementation with its old behavior:
+///   * `MpfrFaithful` models MPFR_RNDA: directed away from zero on every
+///     inexact result. This was the behavior obtained by passing
+///     `Round::AwayZero` directly to MPFR.
+///   * `SmtLib` models the required IEEE/SMT-LIB RNA semantics: round to
+///     nearest, resolving ties away from zero. This is the current fp.rs
+///     behavior through its explicit single-rounding path.
 #[derive(Clone, Copy, PartialEq)]
 enum Sem {
     MpfrFaithful,
